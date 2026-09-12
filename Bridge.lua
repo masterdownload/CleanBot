@@ -497,6 +497,163 @@ NS.CB_RereadBotState = function(key, botName)
     NS.CB_SendBotCommand(botName, "ll ?")
 end
 
+-- ============================================================
+-- Inventory item sell via bridge (ITEM_SELL_SINGLE_V1)
+-- ============================================================
+-- Sends a structured INVENTORY_ITEM_SELL packet to the bridge for selling an item.
+-- The bridge validates bot state, rate limits, and position accuracy, then returns
+-- a structured response with exact status (OK/ERR + reason).
+--
+-- Packet format: "INVENTORY_ITEM_SELL~botName~token~bag~slot~itemId~count"
+-- Response:      "INVENTORY_ITEM_SELL~botName~token~OK/ERR~reason~bag~slot~itemId~soldCount"
+--
+-- Rate limiting: CleanBot enforces a per-bot cooldown (SELL_COOLDOWN_MS) to avoid
+-- hitting the server-side rate limit. Tracks last sell time per bot key.
+NS.SELL_COOLDOWN_MS = 250  -- minimum ms between sells per bot (server rate limit headroom)
+
+-- Last sell timestamp per bot key (for rate limiting).
+NS.sellCooldowns = NS.sellCooldowns or {}  -- [key] = GetTime() * 1000
+
+--- Checks whether we can sell for this bot (rate limit check).
+---@param key string  Bot name-key.
+---@return boolean canSell, number waitMs  Whether to proceed; ms to wait if throttled.
+local function CB_CanSell(key)
+    local now = GetTime() * 1000
+    local last = NS.sellCooldowns[key] or 0
+    local elapsed = now - last
+    if elapsed < NS.SELL_COOLDOWN_MS then
+        return false, NS.SELL_COOLDOWN_MS - elapsed
+    end
+    return true, 0
+end
+
+--- Sends a structured sell packet via the bridge for ITEM_SELL_SINGLE_V1.
+---@param key     string  Bot name-key (CleanBot_PartyBots index).
+---@param botName string  Bot's display name.
+---@param bag     number  Bag index (0-4).
+---@param slot    number  Slot within bag (1-36).
+---@param itemId  number  Item template ID.
+---@param count   number  Number of items to sell.
+NS.CB_SendInventoryItemSell = function(key, botName, bag, slot, itemId, count)
+    if CB_EffectiveBridgeState() ~= "present" then
+        -- Fallback: use whisper command (original behavior)
+        return false
+    end
+
+    local canSell, waitMs = CB_CanSell(key)
+    if not canSell then
+        -- Throttled by CleanBot's rate limiter — queue for later
+        NS.CB_After(waitMs / 1000, function()
+            NS.CB_SendInventoryItemSell(key, botName, bag, slot, itemId, count)
+        end)
+        return true  -- queued
+    end
+
+    NS.sellCooldowns[key] = GetTime() * 1000
+
+    local token = tostring(math.random(100000, 999999))
+    CB_SendBridge("RUN~ITEM_SELL~" .. botName .. "~" .. token .. "~" .. bag .. "~" .. slot .. "~" .. itemId .. "~" .. count)
+    return true
+end
+
+-- ============================================================
+-- Whole-bag item actions (SELL_GREY, etc.) via ITEM_ACTION
+-- ============================================================
+-- Unlike ITEM_SELL (single item, needs exact bag/slot), ITEM_ACTION's SELL_GREY
+-- scans the bot's entire inventory server-side and sells everything gray in one
+-- round trip — no client-side bag/slot bookkeeping needed. This is the right
+-- primitive for a bulk "Sell Trash" button.
+--
+-- Request:  "RUN~ITEM_ACTION~botName~token~action~itemId~count"
+--           (itemId/count are literally "0"/"0" for SELL_GREY/SELL_VENDOR/OPEN_ITEMS)
+-- Response: "INVENTORY_ITEM_ACTION~botName~token~action~itemId~OK/ERR~reason~moved"
+--
+-- Server-side rate limit: 24 requests / 2s, shared across all bots for this player.
+NS.itemActionCallbacks = NS.itemActionCallbacks or {}  -- [key] = { token, callback }
+
+--- Runs a whole-inventory item action for one bot.
+---@param key      string  Bot name-key.
+---@param botName  string  Bot's display name.
+---@param action   string  "SELL_GREY", "SELL_VENDOR", or "OPEN_ITEMS".
+---@param callback fun(success:boolean, reason:string, moved:number)?  Called once the
+---                        response arrives, or immediately with success=false if no
+---                        bridge is present (caller should fall back to whisper).
+---@return boolean sent  True if a bridge request was sent (false = no bridge).
+NS.CB_RunItemAction = function(key, botName, action, callback)
+    if CB_EffectiveBridgeState() ~= "present" then
+        if callback then callback(false, "NO_BRIDGE", 0) end
+        return false
+    end
+
+    local token = tostring(math.random(100000, 999999))
+    NS.itemActionCallbacks[key] = { token = token, callback = callback }
+    CB_SendBridge("RUN~ITEM_ACTION~" .. botName .. "~" .. token .. "~" .. action .. "~0~0")
+    return true
+end
+
+-- ============================================================
+-- Exact (bag/slot-accurate) inventory lookup — INVENTORY_EXACT
+-- ============================================================
+-- The regular GET~INVENTORY snapshot merges stacks by itemId and carries no
+-- bag/slot, so it can't drive a single-item ITEM_SELL packet (which needs the
+-- real bag/slot/count of one physical stack). This query resolves that,
+-- on-demand, right before a single-item sell/move.
+--
+-- Server-side rate limit: 8 requests / 2s, shared across all bots for this
+-- player — fine for on-demand single-item lookups, but never poll this.
+--
+-- Request:  "GET~INVENTORY_EXACT~botName~token"
+-- Response: INV_EXACT_BEGIN~name~token
+--           INV_ITEM_LOC~name~token~bag~slot~itemId~count~soulbound   (0+ times)
+--           INV_EXACT_END~name~token
+--        or INV_EXACT_ERROR~name~token~reason   (e.g. FORBIDDEN, RATE_LIMIT)
+NS.exactInventoryAwait = NS.exactInventoryAwait or {}  -- [key] = { token, items, callback }
+
+--- Requests a bot's exact per-stack inventory (bag/slot/itemId/count per stack).
+---@param key      string  Bot name-key.
+---@param botName  string  Bot's display name.
+---@param callback fun(items:table?, err:string?)  items = array of
+---                        {bag, slot, itemId, count, soulbound}; nil + err on failure.
+---@return boolean sent  False if no bridge is present (callback still fires with NO_BRIDGE).
+NS.CB_RequestInventoryExact = function(key, botName, callback)
+    if CB_EffectiveBridgeState() ~= "present" then
+        callback(nil, "NO_BRIDGE")
+        return false
+    end
+    local token = tostring(math.random(100000, 999999))
+    NS.exactInventoryAwait[key] = { token = token, items = {}, callback = callback }
+    CB_SendBridge("GET~INVENTORY_EXACT~" .. botName .. "~" .. token)
+    return true
+end
+
+-- Rate-limit cleanup: expire stale cooldowns every 60 seconds to prevent memory growth.
+local function CB_CleanupSellCooldowns()
+    local now = GetTime() * 1000
+    for key, last in pairs(NS.sellCooldowns) do
+        if now - last > 60000 then
+            NS.sellCooldowns[key] = nil
+        end
+    end
+end
+NS.CB_CleanupSellCooldowns = CB_CleanupSellCooldowns
+
+
+-- Periodic cleanup: schedule self-recurring cleanup every 60 seconds.
+-- Uses a simple OnUpdate-based timer that re-schedules itself.
+local sellCleanupFrame = CreateFrame("Frame")
+sellCleanupFrame.elapsed = 0
+sellCleanupFrame:Hide()  -- hidden but fires OnUpdate
+sellCleanupFrame:SetScript("OnUpdate", function(self, elapsed)
+    self.elapsed = self.elapsed + elapsed
+    if self.elapsed > 60 then
+        CB_CleanupSellCooldowns()
+        self.elapsed = 0  -- reset counter
+    end
+end)
+-- Start the cleanup timer after a short delay (so other frames are ready)
+NS.CB_After(5, function() sellCleanupFrame:Show() end)
+
+
 -- Sends a combat/non-combat strategy toggle, then arranges an authoritative
 -- re-read so the optimistic UI converges to the bot's real state (self-healing).
 -- Path-aware to avoid reintroducing bridge whisper spam:
@@ -1237,6 +1394,12 @@ bridgeFrame:SetScript("OnEvent", function(self, event, ...)
                 local f = NS.botInventoryFrames and NS.botInventoryFrames[strlower(sender)]
                 if f and f:IsShown() then NS.CB_RenderInventory(strlower(sender)) end
 
+                -- Fresh money/durability/XP just landed — repaint the bot's tab entry
+                -- (the roster list's gold display isn't tied to the inventory window,
+                -- so it needs its own explicit refresh here or it looks stale until a
+                -- manual refresh re-fetches everything).
+                if NS.CB_UpdateTabData then NS.CB_UpdateTabData(strlower(sender)) end
+
                 -- XP just landed — repaint the paperdoll XP bar if this bot is live.
                 if NS.CB_RefreshXPBarForKey then NS.CB_RefreshXPBarForKey(strlower(sender)) end
                 return
@@ -1475,6 +1638,7 @@ bridgeFrame:SetScript("OnEvent", function(self, event, ...)
                     entry.inventory.bagUsed  = tonumber(bagUsed)  or 0
                     entry.inventory.bagTotal = tonumber(bagTotal) or 0
                 end
+                if NS.CB_UpdateTabData then NS.CB_UpdateTabData(key) end
             end
 
         elseif msg and strsub(msg, 1, 9) == "INV_ITEM~" then
@@ -1550,6 +1714,90 @@ bridgeFrame:SetScript("OnEvent", function(self, event, ...)
             local f    = NS.botQuestFrames and NS.botQuestFrames[key]
             if f and f:IsShown() then
                 if NS.CB_RenderQuests then NS.CB_RenderQuests(key) end
+            end
+
+        -- ── Inventory item sell result ───────────────────────────────
+        -- Response to INVENTORY_ITEM_SELL packet:
+        --   "INVENTORY_ITEM_SELL~Name~token~OK/ERR~reason~bag~slot~itemId~soldCount"
+        elseif msg and strsub(msg, 1, 20) == "INVENTORY_ITEM_SELL~" then
+            local rest = strsub(msg, 21)
+            local name, r2   = NS.CB_SplitOnce(rest, "~")
+            local token, r3  = NS.CB_SplitOnce(r2,    "~")
+            local status, r4 = NS.CB_SplitOnce(r3,    "~")
+            local reason, r5 = NS.CB_SplitOnce(r4,    "~")
+            local bagStr, r6 = NS.CB_SplitOnce(r5,    "~")
+            local slotStr, r7= NS.CB_SplitOnce(r6,    "~")
+            local itemIdStr, soldCountStr = NS.CB_SplitOnce(r7, "~")
+            local key = strlower(name)
+            if NS.CB_OnInventorySellResult then
+                NS.CB_OnInventorySellResult(key, name, token, status == "OK", reason,
+                    tonumber(bagStr) or 0, tonumber(slotStr) or 0,
+                    tonumber(itemIdStr) or 0, tonumber(soldCountStr) or 0)
+            end
+
+        -- ── Whole-bag item action result (SELL_GREY, etc.) ──────────────
+        -- Response: "INVENTORY_ITEM_ACTION~Name~token~action~itemId~OK/ERR~reason~moved"
+        elseif msg and strsub(msg, 1, 22) == "INVENTORY_ITEM_ACTION~" then
+            local rest = strsub(msg, 23)
+            local name, r2       = NS.CB_SplitOnce(rest, "~")
+            local token, r3      = NS.CB_SplitOnce(r2,   "~")
+            local _action, r4    = NS.CB_SplitOnce(r3,   "~")  -- echoed action, not needed here
+            local _itemId, r5    = NS.CB_SplitOnce(r4,   "~")  -- always 0 for SELL_GREY
+            local status, r6     = NS.CB_SplitOnce(r5,   "~")
+            local reason, movedStr = NS.CB_SplitOnce(r6, "~")
+            local key = strlower(name)
+            local pending = NS.itemActionCallbacks[key]
+            if pending and pending.token == token then
+                NS.itemActionCallbacks[key] = nil
+                if pending.callback then
+                    pending.callback(status == "OK", reason, tonumber(movedStr) or 0)
+                end
+            end
+
+        -- ── Exact (bag/slot-accurate) inventory result ──────────────────
+        elseif msg and strsub(msg, 1, 16) == "INV_EXACT_BEGIN~" then
+            -- no-op; state already initialized in CB_RequestInventoryExact
+
+        elseif msg and strsub(msg, 1, 13) == "INV_ITEM_LOC~" then
+            local rest = strsub(msg, 14)
+            local name, r2          = NS.CB_SplitOnce(rest, "~")
+            local token, r3         = NS.CB_SplitOnce(r2,   "~")
+            local bagStr, r4        = NS.CB_SplitOnce(r3,   "~")
+            local slotStr, r5       = NS.CB_SplitOnce(r4,   "~")
+            local itemIdStr, r6     = NS.CB_SplitOnce(r5,   "~")
+            local countStr, soulStr = NS.CB_SplitOnce(r6,   "~")
+            local key = strlower(name)
+            local await = NS.exactInventoryAwait[key]
+            if await and await.token == token then
+                local items = await.items
+                items[#items + 1] = {
+                    bag       = tonumber(bagStr) or 0,
+                    slot      = tonumber(slotStr) or 0,
+                    itemId    = tonumber(itemIdStr) or 0,
+                    count     = tonumber(countStr) or 0,
+                    soulbound = soulStr == "1",
+                }
+            end
+
+        elseif msg and strsub(msg, 1, 16) == "INV_EXACT_ERROR~" then
+            local rest = strsub(msg, 17)
+            local name, r2      = NS.CB_SplitOnce(rest, "~")
+            local token, reason = NS.CB_SplitOnce(r2,   "~")
+            local key = strlower(name)
+            local await = NS.exactInventoryAwait[key]
+            if await and await.token == token then
+                NS.exactInventoryAwait[key] = nil
+                await.callback(nil, reason)
+            end
+
+        elseif msg and strsub(msg, 1, 14) == "INV_EXACT_END~" then
+            local rest = strsub(msg, 15)
+            local name, token = NS.CB_SplitOnce(rest, "~")
+            local key = strlower(name)
+            local await = NS.exactInventoryAwait[key]
+            if await and await.token == token then
+                NS.exactInventoryAwait[key] = nil
+                await.callback(await.items, nil)
             end
         end
 

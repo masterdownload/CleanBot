@@ -465,11 +465,17 @@ local function CB_BuildStrip()
     end)
     cogPanel.enableCB = enableCB
 
-    -- Sell Trash (all bots): one party/raid broadcast of "s gray" so every grouped bot vendors its
-    -- grays at once (no per-bot whisper loop). Bots out of vendor range whisper an error the chat
-    -- filter hides. We still reconcile each tracked bot so any open bag windows refresh their lists.
+    -- Sell Trash (all bots): uses bridge for structured bulk sell with per-bot feedback,
+    -- falling back to a party/raid broadcast "s gray" when no bridge is present.
     local btnW = PANEL_W - (cogPanel.paddingLeft or 8) - (cogPanel.paddingRight or 8)
     local sellAllBtn = NS.CB_CreateButton(cogPanel, "CleanBotVendorSellAllBtn", "Sell Trash", btnW, 22, function()
+        -- Bridge path: iterate each tracked bot and bulk-sell its gray items.
+        if NS.CB_SellTrashAll then
+            NS.CB_SellTrashAll()
+            return
+        end
+
+        -- Fallback: broadcast "s gray" to every grouped bot (original behavior).
         NS.CB_SendGroupCommand("s gray")
         if NS.CB_ForEachGroupMember and NS.CB_ScheduleReconcile then
             NS.CB_ForEachGroupMember(function(_, name)

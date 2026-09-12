@@ -191,19 +191,24 @@ local function CB_ShowInvMenu(cell, key)
         -- Trade / Sell apply to everything except quest items (which can't be traded
         -- or vendored). Triggers are "t" and "s" — not "trade"/"sell" (see
         -- docs/playerbot-commands.md, "Chat commands are TRIGGERS, not action names").
+        -- Trade has no bridge equivalent in use here, so it stays a whisper command.
+        -- Sell shares NS.CB_DoSell with the plain-right-click merchant sell (below) so
+        -- both routes use the same whisper-free bridge path and behave identically.
         if not isQuest then
-            local function addItemCmd(label, trigger, refetch)
-                info.text = label
-                info.func = function()
-                    local entry = CleanBot_PartyBots[key]
-                    if not entry then return end
-                    NS.CB_SendBotCommand(entry.name, trigger .. " " .. NS.CB_CleanItemLink(cell.itemLink))
-                    if refetch then NS.CB_ScheduleReconcile(key, entry.name) end
-                end
-                UIDropDownMenu_AddButton(info)
+            info.text = "Trade"
+            info.func = function()
+                local entry = CleanBot_PartyBots[key]
+                if not entry then return end
+                NS.CB_SendBotCommand(entry.name, "t " .. NS.CB_CleanItemLink(cell.itemLink))
             end
-            addItemCmd("Trade", "t", false)
-            addItemCmd("Sell",  "s", true)
+            UIDropDownMenu_AddButton(info)
+
+            info.text = "Sell"
+            info.func = function()
+                local entry = CleanBot_PartyBots[key]
+                if entry and NS.CB_DoSell then NS.CB_DoSell(cell, key, entry) end
+            end
+            UIDropDownMenu_AddButton(info)
 
             -- Deposit to the guild bank (bags → guild-bank tab 0). Deposit-only: the server
             -- can't list or withdraw a bot's guild bank, and the guild bank is shared guild-wide.
@@ -288,19 +293,85 @@ KINDS.bank.menu      = CB_ShowBankMenu
 -- Uncommon-or-better items confirm first (bots have no vendor buyback). The popup
 -- registers lazily because NS.CB_RegisterConfirmPopup lives in ManageTab.lua, which
 -- loads after this file.
-local function CB_DoSell(cell, key, entry)
-    local link = cell.itemLink
-    if not link then return end
-    NS.CB_SendBotCommand(entry.name, "s " .. NS.CB_CleanItemLink(link))
-    -- Optimistic update: a vendor sale clears the whole stack — blank the cell now (mirrors the
-    -- right-click "Use" path), then reconcile against the bot's real bags.
+local function CB_BlankSellCell(cell)
     cell.icon:Hide()
     cell.countText:Hide()
     cell.itemLink = nil
     NS.CB_ClearQualityBorder(cell)
     NS.CB_SetRarityOverlay(cell, nil)
-    NS.CB_ScheduleReconcile(key, entry.name)
 end
+
+local function CB_DoSell(cell, key, entry)
+    local link = cell.itemLink
+    if not link then return end
+    if NS.CB_CheckBotVendorRange and not NS.CB_CheckBotVendorRange(entry.name) then return end
+
+    local itemId = tonumber(strmatch(link, "item:(%d+)")) or 0
+    local _, _, quality = GetItemInfo(link)
+
+    -- Gray/poor items: route through the whole-bag SELL_GREY action rather than a
+    -- single-stack sell packet. The regular inventory snapshot merges same-itemId
+    -- stacks from different bags into one display count, so a single sell packet
+    -- can't reliably target "just this stack" for grays anyway — and selling every
+    -- gray item is exactly what vendoring a piece of junk is expected to do.
+    if quality == 0 and NS.CB_RunItemAction then
+        CB_BlankSellCell(cell)
+        NS.CB_RunItemAction(key, entry.name, "SELL_GREY", function(success, reason, moved)
+            if reason ~= "ITEM_NOT_FOUND" then
+                NS.CB_FlashCell(cell, (success and moved > 0) and "success" or "failure")
+            end
+            NS.CB_ReportSellGreyResult(entry.name, entry, key, success, reason, moved)
+        end)
+        return
+    end
+
+    -- Non-gray items need the item's real bag/slot, which the regular snapshot
+    -- doesn't carry — resolve it via the exact-inventory query, then sell every
+    -- physical stack of this itemId (there can be more than one, e.g. split
+    -- across bags; each needs its own bag/slot/count in the sell packet).
+    if NS.CB_RequestInventoryExact and NS.CB_SendInventoryItemSell then
+        NS.CB_RequestInventoryExact(key, entry.name, function(items, err)
+            if not items then
+                -- Couldn't resolve a location via the bridge (rate-limited, no bridge,
+                -- etc.) — nothing sent, restore the cell rather than silently sell
+                -- nothing while showing an empty slot.
+                NS.CB_Print("|cffff4444" .. entry.name .. ": couldn't sell (" .. tostring(err) .. ")|r")
+                NS.CB_ScheduleReconcile(key, entry.name)
+                return
+            end
+
+            local stacks = {}
+            for _, it in ipairs(items) do
+                if it.itemId == itemId then stacks[#stacks + 1] = it end
+            end
+
+            if #stacks == 0 then
+                NS.CB_Print("|cffff4444" .. entry.name .. ": item not found in bags (may have moved) — try again.|r")
+                NS.CB_ScheduleReconcile(key, entry.name)
+                return
+            end
+
+            CB_BlankSellCell(cell)
+            NS.sellTargetCell[key] = cell  -- flashed by CB_OnInventorySellResult on the first reply
+
+            local idx = 1
+            local function SellNext()
+                if idx > #stacks then return end
+                local stack = stacks[idx]
+                idx = idx + 1
+                NS.CB_SendInventoryItemSell(key, entry.name, stack.bag, stack.slot, stack.itemId, stack.count)
+                NS.CB_After(0.15, SellNext)
+            end
+            SellNext()
+        end)
+        return
+    end
+
+    -- No bridge at all: this feature depends on the bridge, so just report it
+    -- rather than silently falling back to a whisper.
+    NS.CB_Print("|cffff4444" .. entry.name .. ": bridge sell unavailable (no bridge).|r")
+end
+NS.CB_DoSell = CB_DoSell
 
 local function CB_EnsureSellPopup()
     if StaticPopupDialogs["CLEANBOT_MERCHANT_SELL"] or not NS.CB_RegisterConfirmPopup then return end
@@ -313,6 +384,190 @@ local function CB_EnsureSellPopup()
             if e and data.cell and data.cell.itemLink == data.link then CB_DoSell(data.cell, data.key, e) end
         end)
 end
+
+-- ============================================================
+-- Inventory item sell result handling (bridge path)
+-- ============================================================
+-- Called by Bridge.lua when an INVENTORY_ITEM_SELL response arrives.
+-- Provides per-item feedback: green flash for success, red flash for failure.
+--- Tracks the cell being sold so we can flash it on result.
+NS.sellTargetCell = NS.sellTargetCell or {}  -- [key] = cell
+
+--- Refreshes a bot's inventory data the same way the window's own "Refresh"
+--- button does (calls the same underlying fetch, not a simulated widget click).
+---@param key     string  Bot name-key.
+---@param botName string  Bot's display name.
+local function CB_ClickRefreshButton(key, botName)
+    if NS.CB_FetchInventory then
+        NS.CB_FetchInventory(key, botName)
+    end
+end
+
+--- Handles a single item sell result from the bridge.
+--- key       string  Bot name-key.
+--- botName   string  Bot display name.
+--- token     string  Request token (for matching).
+--- success   boolean Whether the sell succeeded.
+--- reason    string  Error reason if failed (empty on success).
+--- bag       number  Bag index.
+--- slot      number  Slot within bag.
+--- itemId    number  Item template ID.
+--- soldCount number  Number of items actually sold.
+NS.CB_OnInventorySellResult = function(key, botName, token, success, reason, bag, slot, itemId, soldCount)
+    -- Flash the tracked cell (set by CB_DoSell before sending).
+    local targetCell = NS.sellTargetCell[key]
+    if targetCell and targetCell:IsShown() then
+        NS.CB_FlashCell(targetCell, success and "success" or "failure")
+        -- Restore cell content on failure so user sees what failed.
+        -- (The optimistic blank is reverted by the reconcile.)
+    end
+    if not success and reason and reason ~= "" then
+        NS.CB_Print("|cffff4444[" .. botName .. "] sell failed: " .. reason .. "|r")
+    end
+
+    -- Clear tracked cell.
+    NS.sellTargetCell[key] = nil
+
+    -- Refresh exactly the way the window's own Refresh button does, and give an
+    -- explicit sound cue — this path is a silent addon message, not a whisper,
+    -- so there's no default WoW chat-notification sound to piggyback on.
+    local entry = CleanBot_PartyBots[key]
+    if entry then
+        NS.CB_ScheduleReconcile(key, botName)
+        if success then
+            CB_ClickRefreshButton(key, botName)
+            PlaySound("LOOTWINDOWCOINSOUND")
+        end
+    end
+end
+
+-- Cell flash helpers — brief green/red overlay on sell success/failure.
+local FLASH_DURATIONS = { success = 0.4, failure = 0.6 }
+local FLASH_COLORS    = { success = { r = 0, g = 1, b = 0 }, failure = { r = 1, g = 0, b = 0 } }
+
+--- Flashes a cell with a colored overlay for visual feedback.
+--- cell  table   The inventory/bank cell to flash.
+--- type  string  "success" (green) or "failure" (red).
+NS.CB_FlashCell = function(cell, type)
+    if not cell or not type then return end
+    local cfg = FLASH_DURATIONS[type]
+    if not cfg then return end
+    local color = FLASH_COLORS[type]
+    if not color then return end
+
+    -- Create flash overlay if it doesn't exist.
+    if not cell.flashOverlay then
+        local ov = cell:CreateTexture(nil, "OVERLAY")
+        ov:SetAllPoints(cell)
+        ov:SetBlendMode("ADD")
+        ov:Hide()
+        cell.flashOverlay = ov
+    end
+
+    local ov = cell.flashOverlay
+    ov:SetVertexColor(color.r, color.g, color.b)
+    ov:SetAlpha(1)
+    ov:Show()
+    UIFrameFade(ov, { mode = "OUT", timeToFade = cfg, startAlpha = 1, endAlpha = 0,
+        finishedFunc = function() ov:Hide() end })
+end
+
+-- ============================================================
+-- Bulk sell all gray (poor quality) items for a single bot
+-- ============================================================
+-- Friendly text for the SELL_GREY failure reasons the bridge can return.
+-- ITEM_NOT_FOUND just means the bot's bags are already clean — that's an
+-- everyday outcome, not an error, so it gets its own non-alarming phrasing
+-- instead of the generic "sell failed (...)" line.
+local SELL_GREY_REASON_TEXT = {
+    ITEM_NOT_FOUND   = "no more junk",
+    VENDOR_NOT_FOUND = "not near a vendor",
+    RATE_LIMIT       = "rate limited — try again in a moment",
+    FORBIDDEN        = "not allowed to control that bot",
+    NO_BOT           = "bot not found",
+}
+
+--- Prints a one-line result for a SELL_GREY action and refreshes state.
+---@param botName string   Bot's display name (for the printed message).
+---@param entry   table    CleanBot_PartyBots entry (for the stats refresh).
+---@param key     string   Bot name-key (for the reconcile).
+---@param success boolean  Whether the server reported OK.
+---@param reason  string   Reason/status string from the response.
+---@param moved   number   Items sold.
+NS.CB_ReportSellGreyResult = function(botName, entry, key, success, reason, moved)
+    if reason == "ITEM_NOT_FOUND" then
+        NS.CB_Print("no more junk")
+    elseif success and moved > 0 then
+        NS.CB_Print(botName .. ": sold " .. moved .. " gray item(s).")
+    elseif not success then
+        local friendly = SELL_GREY_REASON_TEXT[reason]
+        NS.CB_Print("|cffff4444" .. botName .. ": " .. (friendly or ("sell failed (" .. tostring(reason) .. ")")) .. "|r")
+    end
+
+    NS.CB_ScheduleReconcile(key, botName)
+    if success and moved > 0 then
+        -- Same refresh mechanism and sound cue as the single-item sell path —
+        -- SELL_GREY is also a silent bridge action with no whisper to piggyback a
+        -- notification sound on.
+        CB_ClickRefreshButton(key, botName)
+        PlaySound("LOOTWINDOWCOINSOUND")
+    end
+end
+
+--- Sells every gray-quality item from a bot's bags via the bridge's whole-bag
+--- SELL_GREY action (server scans and sells all gray items in one round trip —
+--- no bag/slot bookkeeping needed on the client, and it works regardless of
+--- whether that bot's bag window is currently open).
+---@param key      string   Bot name-key.
+---@param onResult fun(success:boolean, reason:string, moved:number)?  Optional,
+---                         called once the server responds (or immediately on
+---                         a whisper-fallback send, where no result is known).
+NS.CB_SellAllGray = function(key, onResult)
+    local entry = CleanBot_PartyBots[key]
+    if not entry or not entry.name then return end
+
+    local sent = NS.CB_RunItemAction and NS.CB_RunItemAction(key, entry.name, "SELL_GREY",
+        function(success, reason, moved)
+            NS.CB_ReportSellGreyResult(entry.name, entry, key, success, reason, moved)
+            if onResult then onResult(success, reason, moved) end
+        end)
+
+    if not sent then
+        -- No bridge — fall back to the bot's own whisper command (fire-and-forget,
+        -- no per-item feedback available on this path).
+        NS.CB_SendBotCommand(entry.name, "s gray")
+        NS.CB_ScheduleReconcile(key, entry.name)
+        if onResult then onResult(false, "NO_BRIDGE", 0) end
+    end
+end
+
+
+-- ============================================================
+-- Bulk sell trash for ALL tracked bots (Merchant "Sell Trash" button)
+-- ============================================================
+--- Sells all gray items for every tracked bot. Requests are staggered (one
+--- bot every 0.1s) to stay comfortably under the bridge's shared ITEM_ACTION
+--- rate limit (24 requests / 2s, across all bots for this player) even for a
+--- full raid.
+NS.CB_SellTrashAll = function()
+    local keys = {}
+    for key, entry in pairs(CleanBot_PartyBots) do
+        if entry.name then keys[#keys + 1] = key end
+    end
+
+    if #keys == 0 then
+        NS.CB_Print("No tracked bots found to sell trash.")
+        return
+    end
+
+    NS.CB_Print("Selling trash for " .. #keys .. " bot(s).")
+    for i, key in ipairs(keys) do
+        NS.CB_After((i - 1) * 0.1, function()
+            NS.CB_SellAllGray(key)
+        end)
+    end
+end
+
 
 --- Right-click-to-sell from a bot's inventory cell. Quality >= 2 (uncommon/green or
 --- better) asks for confirmation first; poor/common sell immediately.
@@ -847,10 +1102,7 @@ local function CB_GetGridFrame(kind, key, botName)
         -- TRIGGERS, not action names").
         local sellBtn = makeActionButton("CleanBotInvSellBtn_" .. key, "Interface\\Icons\\INV_Misc_Coin_03",
             "Sell All Gray Items (Requires a Nearby Vendor)", function()
-                local e       = CleanBot_PartyBots[key]
-                local bn      = (e and e.name) or key
-                NS.CB_SendBotCommand(bn, "s gray")
-                NS.CB_ScheduleReconcile(key, bn)
+                NS.CB_SellAllGray(key)
             end)
         sellBtn:SetPoint("RIGHT", refreshBtn, "LEFT", 0, 0)
 
@@ -1042,6 +1294,8 @@ local function CB_PatchInventory(f, rawItems, bagTotal, bagUsed, entry)
             cell.icon:SetTexture(GetItemIcon(strmatch(item.link, "item:(%d+)") or 0))
             cell.icon:Show()
             cell.itemLink = item.link
+            cell.bag  = item.bag
+            cell.slot = item.slot
             NS.CB_ApplyItemVisuals(cell, item.link)
             if item.count > 1 then
                 cell.countText:SetText(item.count)
@@ -1295,6 +1549,8 @@ local function CB_RenderGrid(kind, key, forceFull)
             cell.icon:SetTexture(tex)
             cell.icon:Show()
             cell.itemLink = item.link
+            cell.bag  = item.bag
+            cell.slot = item.slot
             NS.CB_ApplyItemVisuals(cell, item.link)
             if item.count > 1 then
                 cell.countText:SetText(item.count)
@@ -1306,6 +1562,8 @@ local function CB_RenderGrid(kind, key, forceFull)
             cell.icon:Hide()
             cell.countText:Hide()
             cell.itemLink = nil
+            cell.bag  = nil
+            cell.slot = nil
             NS.CB_ApplyItemVisuals(cell, nil)
         end
 
