@@ -438,6 +438,51 @@ NS.CB_SendBotCommand = function(botName, command)
     NS.CB_EnqueueRequest(strlower(botName), function() CB_SendBotCommandRaw(botName, command) end)
 end
 
+--- Applies a fetched combat/non-combat strategy snapshot to a bot's entry,
+--- creating a minimal entry if none exists yet (e.g. state arrived before
+--- ROSTER~/DETAIL~), and repaints its tab. Shared by the legacy flat STATE~
+--- handler and the framed STATE_BEGIN/STATE_ITEM/STATE_END handlers below.
+---@param name      string  Bot's display name (not lowercased).
+---@param combatStr string  ", "-separated combat strategy list.
+---@param ncStr     string  ", "-separated non-combat strategy list.
+local function CB_ApplyStateSnapshot(name, combatStr, ncStr)
+    name = name and name:match("^%s*(.-)%s*$")
+    if not name or name == "" then return end
+    local key   = strlower(name)
+    local entry = CleanBot_PartyBots[key]
+    if not entry then
+        local class = NS.CB_ResolveClass(name, "WARRIOR")
+        entry = {
+            name      = name,
+            class     = class,
+            combat    = NS.CB_DefaultCombat(),
+            nonCombat = NS.CB_DefaultNonCombat(),
+            classData = NS.CB_DefaultClassData(class),
+        }
+        CleanBot_PartyBots[key] = entry
+    else
+        entry.class = NS.CB_ResolveClass(name, entry.class)
+    end
+    NS.CB_StoreCombat(entry, combatStr)
+    NS.CB_StoreNonCombat(entry, ncStr)
+    if NS.CB_UpdateTabData then NS.CB_UpdateTabData(key) end
+end
+
+-- Per-bot staging buffer for the framed STATE_BEGIN/STATE_ITEM/STATE_END
+-- protocol — accumulates strategies between STATE_BEGIN and STATE_END, since
+-- they arrive as individual small packets rather than one joined string.
+NS.stateFrameStaging = NS.stateFrameStaging or {}  -- [botNameLower] = { name, combat = {}, nonCombat = {} }
+
+--- Sends a GET~STATES request. Always includes a token: with no token the
+--- server uses its legacy per-bot single-packet sender, which silently drops
+--- (never sends, only logs server-side) any bot whose combined strategy list
+--- doesn't fit in one 255-byte addon message — with a token, it uses the
+--- framed sender (STATES_BEGIN/STATE_BEGIN/STATE_ITEM/STATE_END/STATES_END),
+--- which sends each strategy as its own small packet instead of one big one.
+local function CB_SendGetStates()
+    CB_SendBridge("GET~STATES~" .. tostring(math.random(100000, 999999)))
+end
+
 NS.CB_RequestSync = function()
     if NS.syncPending then return end
     NS.syncPending = true
@@ -446,7 +491,7 @@ NS.CB_RequestSync = function()
         if CB_EffectiveBridgeState() == "present" then
             CB_SendBridge("GET~ROSTER")
             CB_SendBridge("GET~DETAILS")
-            CB_SendBridge("GET~STATES")
+            CB_SendGetStates()
         elseif CB_EffectiveBridgeState() == "absent" then
             CB_ProbePartyForBots()
         end
@@ -463,7 +508,7 @@ end
 
 -- Lightweight, debounced strategy-state re-sync (bridge path). Unlike
 -- CB_RequestSync it sends ONLY GET~STATES — no ROSTER/DETAILS and no RefreshTabs —
--- so it reconciles strategy flags (via the STATE~ handler → CB_StoreCombat/
+-- so it reconciles strategy flags (via the framed STATE_* handlers → CB_StoreCombat/
 -- CB_StoreNonCombat → CB_UpdateTabData) without tab/inspect churn. Used to verify a
 -- strategy toggle silently after sending it over the bridge.
 NS.statesPending = false
@@ -473,7 +518,7 @@ NS.CB_RequestStates = function()
     NS.CB_After(0.4, function()
         NS.statesPending = false
         if CB_EffectiveBridgeState() == "present" then
-            CB_SendBridge("GET~STATES")
+            CB_SendGetStates()
         end
     end)
 end
@@ -1578,34 +1623,71 @@ bridgeFrame:SetScript("OnEvent", function(self, event, ...)
             end
 
         elseif msg and strsub(msg, 1, 6) == "STATE~" then
-            -- Bridge strategy snapshot for one bot: STATE~Name~combat~nonCombat
-            -- (combat / nonCombat are comma-separated strategy lists.)
+            -- Legacy flat strategy snapshot for one bot: STATE~Name~combat~nonCombat
+            -- (combat / nonCombat are ", "-separated strategy lists). Only sent by
+            -- the server's legacy per-bot sender, which we no longer trigger (see
+            -- CB_SendGetStates) — kept here in case anything else still sends it.
             NS.lastRawStates = msg
             local rest             = strsub(msg, 7)
             local name, r2         = NS.CB_SplitOnce(rest, "~")
             local combatStr, ncStr = NS.CB_SplitOnce(r2,   "~")
-            name = name:match("^%s*(.-)%s*$")
-            if name and name ~= "" then
-                local key   = strlower(name)
-                local entry = CleanBot_PartyBots[key]
-                if not entry then
-                    -- STATE~ arrived before ROSTER~/DETAIL~; create a minimal entry.
-                    local class = NS.CB_ResolveClass(name, "WARRIOR")
-                    entry = {
-                        name      = name,
-                        class     = class,
-                        combat    = NS.CB_DefaultCombat(),
-                        nonCombat = NS.CB_DefaultNonCombat(),
-                        classData = NS.CB_DefaultClassData(class),
-                    }
-                    CleanBot_PartyBots[key] = entry
-                else
-                    entry.class = NS.CB_ResolveClass(name, entry.class)
+            CB_ApplyStateSnapshot(name, combatStr, ncStr)
+
+        -- ── Framed strategy-state snapshot (chunked) ────────────────────
+        -- Used instead of the legacy flat STATE~ opcode as of CB_SendGetStates
+        -- sending a token: the server's legacy sender builds one packet per bot
+        -- with its full combat+non-combat strategy list joined together, and
+        -- SILENTLY DROPS (server-log only, nothing reaches the client) any bot
+        -- whose combined list doesn't fit in one 255-byte addon message — which
+        -- happens routinely for bots with many Wrath Unbound strategies active.
+        -- The framed sender instead sends each strategy as its own small
+        -- STATE_ITEM packet, so no single bot's data ever gets dropped for
+        -- being too long overall.
+        --   STATES_BEGIN~token~botCount              (bulk GET~STATES~token only)
+        --   STATE_BEGIN~token~encodedName~cCount~ncCount
+        --   STATE_ITEM~token~encodedName~C|N~index~encodedStrategyName  (0+ times)
+        --   STATE_END~token~encodedName~cCount~ncCount
+        --   STATES_END~token~botCount                (bulk GET~STATES~token only)
+        elseif msg and strsub(msg, 1, 13) == "STATES_BEGIN~" then
+            -- no-op; each bot's own STATE_BEGIN~ (below) resets its staging.
+
+        elseif msg and strsub(msg, 1, 12) == "STATE_BEGIN~" then
+            local rest = strsub(msg, 13)
+            local _token, r2       = NS.CB_SplitOnce(rest, "~")
+            local encodedName      = NS.CB_SplitOnce(r2, "~")
+            local name = CB_UrlDecode(encodedName)
+            NS.stateFrameStaging[strlower(name)] = { name = name, combat = {}, nonCombat = {} }
+
+        elseif msg and strsub(msg, 1, 11) == "STATE_ITEM~" then
+            local rest = strsub(msg, 12)
+            local _token, r2        = NS.CB_SplitOnce(rest, "~")
+            local encodedName, r3   = NS.CB_SplitOnce(r2, "~")
+            local scope, r4         = NS.CB_SplitOnce(r3, "~")
+            local _index, encodedStrategy = NS.CB_SplitOnce(r4, "~")
+            local staging = NS.stateFrameStaging[strlower(CB_UrlDecode(encodedName))]
+            if staging then
+                local strategy = CB_UrlDecode(encodedStrategy)
+                if scope == "C" then
+                    staging.combat[#staging.combat + 1] = strategy
+                elseif scope == "N" then
+                    staging.nonCombat[#staging.nonCombat + 1] = strategy
                 end
-                NS.CB_StoreCombat(entry, combatStr)
-                NS.CB_StoreNonCombat(entry, ncStr)
-                if NS.CB_UpdateTabData then NS.CB_UpdateTabData(key) end
             end
+
+        elseif msg and strsub(msg, 1, 10) == "STATE_END~" then
+            local rest = strsub(msg, 11)
+            local _token, r2  = NS.CB_SplitOnce(rest, "~")
+            local encodedName = NS.CB_SplitOnce(r2, "~")
+            local key = strlower(CB_UrlDecode(encodedName))
+            local staging = NS.stateFrameStaging[key]
+            if staging then
+                NS.stateFrameStaging[key] = nil
+                CB_ApplyStateSnapshot(staging.name, table.concat(staging.combat, ", "),
+                    table.concat(staging.nonCombat, ", "))
+            end
+
+        elseif msg and strsub(msg, 1, 11) == "STATES_END~" then
+            -- no-op; each bot's own STATE_END~ (above) already applied its snapshot.
 
         elseif msg and strsub(msg, 1, 10) == "INV_BEGIN~" then
             local rest = strsub(msg, 11)
