@@ -13,6 +13,7 @@ Skinning\Layout.lua
 Skinning\Widgets.lua
 Skinning\QuestWidgets.lua
 Skinning\ItemVisuals.lua
+BridgeRpc.lua
 Bridge.lua
 Overhear.lua
 CommandControls.lua
@@ -30,6 +31,7 @@ Trade.lua
 Merchant.lua
 Recruiter.lua
 UnitMenu.lua
+AltArmy.lua
 ManageTab.lua
 GroupTab.lua
 SettingsTab.lua

@@ -31,10 +31,12 @@ NS.CB_CleanItemLink = function(rawLink)
 end
 
 -- Numeric class ids as sent in ROSTER~ records (Player::getClass()); 10 is unused.
+-- Exported: ALT_ROSTER_ENTRY rows carry the same numbering (AltArmy.lua).
 local CLASS_ID_TOKENS = {
     [1] = "WARRIOR", [2] = "PALADIN", [3] = "HUNTER",  [4] = "ROGUE",   [5] = "PRIEST",
     [6] = "DEATHKNIGHT", [7] = "SHAMAN", [8] = "MAGE", [9] = "WARLOCK", [11] = "DRUID",
 }
+NS.CLASS_ID_TOKENS = CLASS_ID_TOKENS
 
 -- ============================================================
 -- Bot discovery / roster helpers
@@ -332,17 +334,21 @@ end
 -- Sends a bridge addon packet on the correct channel:
 --   • In a raid  → "RAID"   ("PARTY" does not reach raid members)
 --   • In a party → "PARTY"
---   • Solo + self-management on → "WHISPER" to self. The server bridge replies directly
---     to the sender (player->SendDirectMessage in MultiBotBridge.cpp) and its chat hook
---     fires on the whisper overload regardless of recipient, so a self-whisper completes
+--   • Solo, with or without self-management → "WHISPER" to self. The server bridge replies
+--     directly to the sender (player->SendDirectMessage in MultiBotBridge.cpp) and its chat
+--     hook fires on the whisper overload regardless of recipient, so a self-whisper completes
 --     the handshake and carries all GET~/RUN~ traffic with no group present.
---   • Solo without self-management → no bots to talk to, so this no-ops.
+--   Solo used to require NS.selfBotActive here, which made the bridge unreachable until
+--   something was already grouped — exactly wrong for the account-scoped endpoints (ALT_ROSTER,
+--   BOT_CONNECT), whose whole job is bringing the FIRST alt online. Unverified in 3.3.5 with no
+--   bot online at all: if the client drops a self-addressed addon whisper, detection simply times
+--   out to "absent" and every caller keeps its SAY fallback.
 local function CB_SendBridge(msg)
     if GetNumRaidMembers() > 0 then
         SendAddonMessage("MBOT", msg, "RAID")
     elseif GetNumPartyMembers() > 0 then
         SendAddonMessage("MBOT", msg, "PARTY")
-    elseif NS.selfBotActive then
+    else
         SendAddonMessage("MBOT", msg, "WHISPER", UnitName("player"))
     end
 end
@@ -1217,11 +1223,9 @@ local function CB_BridgeRequest()
 end
 
 local function CB_SendHello()
-    -- CB_SendBridge picks the channel (group broadcast, or self-whisper when solo +
-    -- selfBotActive), and no-ops when there is nothing to detect against.
-    if NS.CB_InGroup() or NS.selfBotActive then
-        CB_SendBridge("HELLO~1")
-    end
+    -- CB_SendBridge picks the channel: group broadcast, or a self-whisper when solo. Always
+    -- worth asking — an account-scoped endpoint may answer even with no bots in existence.
+    CB_SendBridge("HELLO~1")
 end
 
 -- Sends HELLO and, if no HELLO_ACK arrives within the timeout, declares the
@@ -1230,9 +1234,8 @@ end
 local function CB_StartBridgeDetection()
     if NS.bridgeState ~= "unknown" then return end
     if NS.bridgeDetecting then return end           -- a detection timer is already running
-    -- Need either a group to detect against, or an active self-bot (which talks to the
-    -- bridge over a self-whisper). Solo with no self-bot has nothing to detect.
-    if not NS.CB_InGroup() and not NS.selfBotActive then return end
+    -- No group/self-bot precondition: solo detection runs over a self-whisper (CB_SendBridge),
+    -- and bailing out here used to leave NS.loginPhaseActive set for the rest of the session.
     NS.bridgeDetecting = true
     CB_SendHello()
 
@@ -1556,6 +1559,9 @@ bridgeFrame:SetScript("OnEvent", function(self, event, ...)
             -- the override forces "absent", so /cbdebug bridge reset can restore the
             -- true state. CB_BridgeRequest below re-syncs via the effective path.
             NS.lastHelloAck = msg
+            -- Hand the handshake to BridgeRpc.lua: it records protocol/name and arms the
+            -- capability-collection state machine (CAPS_BEGIN/CAPS/CAPS_END follows).
+            if NS.CB_ParseHelloAck then NS.CB_ParseHelloAck(msg) end
             if not NS.bridgeReady then
                 NS.bridgeReady      = true
                 NS.bridgeState      = "present"
@@ -1881,6 +1887,12 @@ bridgeFrame:SetScript("OnEvent", function(self, event, ...)
                 NS.exactInventoryAwait[key] = nil
                 await.callback(await.items, nil)
             end
+
+        else
+            -- Everything else belongs to the protocol layer (BridgeRpc.lua): CAPS_*, PONG,
+            -- ERR, and the framed packets features subscribe to via NS.CB_OnBridgeTag.
+            -- Keeping this the only fall-through means new endpoints need no edits here.
+            if NS.CB_RpcInbound then NS.CB_RpcInbound(msg) end
         end
 
     elseif event == "CHAT_MSG_SYSTEM" then
@@ -1984,6 +1996,11 @@ bridgeFrame:SetScript("OnEvent", function(self, event, ...)
 
         NS.loginPhaseActive = not isReload  -- gate bot probing on fresh login only
         NS.joinCandidates   = {}
+        -- New session, new bridge session: drop caps, in-flight requests and rate budgets
+        -- so nothing from the previous connection can be acted on (BridgeRpc.lua).
+        if NS.CB_ResetRpcState then NS.CB_ResetRpcState("relog") end
+        -- The account's alt snapshot belongs to the old session too (AltArmy.lua).
+        if NS.CB_AltArmyReset then NS.CB_AltArmyReset("relog") end
         NS.bridgeReady      = false
         NS.bridgeState      = "unknown"
         NS.bridgeDetecting  = false
@@ -2008,8 +2025,8 @@ bridgeFrame:SetScript("OnEvent", function(self, event, ...)
         -- above can no-op (GetNum*Members == 0) and the roster event may have
         -- already fired during the loading screen. Retry a few times so being
         -- already in a group — especially a raid — is reliably detected.
-        -- CB_StartBridgeDetection is idempotent (guards on state / in-progress /
-        -- in-group), so extra calls are harmless once detection has begun.
+        -- CB_StartBridgeDetection is idempotent (guards on state / in-progress), so extra
+        -- calls are harmless once detection has begun.
         NS.CB_After(1, CB_StartBridgeDetection)
         NS.CB_After(3, CB_StartBridgeDetection)
         NS.CB_After(6, CB_StartBridgeDetection)

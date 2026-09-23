@@ -39,6 +39,8 @@ local function CB_HandleSlash(msg)
         print("  /cbdebug bridge on        — force bridge present (bridge path)")
         print("  /cbdebug bridge reset     — clear override; follow real handshake")
         print("  /cbdebug simulate         — toggle simulate mode (print instead of send)")
+        print("  /cbdebug caps             — bridge protocol version + capabilities")
+        print("  /cbdebug rpc              — toggle per-request RPC tracing")
     end
 end
 

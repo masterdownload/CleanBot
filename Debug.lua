@@ -176,6 +176,11 @@ end
 NS.CB_SetBridgeOverride = function(value)
     NS.debugBridgeOverride = value
     if CleanBot_SavedVars then CleanBot_SavedVars.debugBridgeOverride = value end
+    -- The override changes which packets can arrive, so the negotiated capability set,
+    -- in-flight requests and rate budgets are all stale from here on (BridgeRpc.lua).
+    if NS.CB_ResetRpcState then NS.CB_ResetRpcState("override") end
+    -- ...and so is the cached Alt Army snapshot, which only the live bridge can refresh.
+    if NS.CB_AltArmyReset then NS.CB_AltArmyReset("override") end
     if value == "absent" then
         NS.CB_Print("Bridge override set to |cffff4444absent|r (whisper fallback).")
     elseif value == "present" then
@@ -225,6 +230,8 @@ end
 --   /cbdebug bridge reset  — clear override; follow real handshake result
 --   /cbdebug simulate      — toggle simulate mode (print commands instead of sending)
 --   /cbdebug verify        — toggle strategy-toggle mismatch logging
+--   /cbdebug caps          — dump the negotiated bridge capabilities + RPC state
+--   /cbdebug rpc           — toggle per-request tracing in chat
 -- ============================================================
 SLASH_CBDEBUG1 = "/cbdebug"
 SlashCmdList["CBDEBUG"] = function(msg)
@@ -251,9 +258,17 @@ SlashCmdList["CBDEBUG"] = function(msg)
     elseif msg == "verify" then
         NS.CB_SetDebugVerify(not NS.debugVerify)
         return
+    elseif msg == "caps" then
+        if NS.CB_DebugCapsReport then NS.CB_DebugCapsReport() end
+        return
+    elseif msg == "rpc" then
+        NS.debugRpc = not NS.debugRpc
+        print("RPC tracing: " .. (NS.debugRpc and "|cff00ff00ON|r" or "|cffff4444OFF|r") .. ".")
+        return
     end
 
     -- Default: quick group/cache/state dump.
+    if NS.CB_BridgeStatusLine then print(NS.CB_BridgeStatusLine()) end
     print(string.format("Bridge: real=%s override=%s simulate=%s verify=%s tabEnabled=%s loginPhase=%s",
         tostring(NS.bridgeState),
         tostring(NS.debugBridgeOverride or "none"),

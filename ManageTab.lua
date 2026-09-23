@@ -187,6 +187,9 @@ CB_RegisterEditPopup("CLEANBOT_INVITE_BY_NAME",
             NS.CB_Print("Please enter at least one character name.")
             return
         end
+        -- Multi-name input: the bridge takes the whole list (see CB_AltArmyConnectNames);
+        -- without one this stays the single comma-joined command it always was.
+        if NS.CB_AltArmyConnectNames and NS.CB_AltArmyConnectNames(names) then return end
         SendChatMessage(".playerbots bot add " .. table.concat(names, ","), "SAY")
     end)
 
@@ -386,11 +389,16 @@ NS.CleanBot_BuildManageTab = function()
         end)
     NS.CB_AnchorBelow(uninviteAllBtn, uninviteTargetBtn)
 
+    -- Login/Logout go through AltArmy.lua: RUN~BOT_CONNECT / RUN~BOT_DISCONNECT when the
+    -- bridge offers BOT_LIFECYCLE (verdict comes back on the wire), and the SAY command
+    -- below is what it falls back to when it does not.
     local loginTargetBtn = NS.CB_CreateButton(targetSection.bg, "CleanBotManageLoginTargetBtn",
         "Login Target", 120, 24, function()
             local target = requireValidPlayerTarget()
             if not target then return end
-            SendChatMessage(".playerbots bot add " .. target, "SAY")
+            if not NS.CB_AltArmyConnect(target) then
+                SendChatMessage(".playerbots bot add " .. target, "SAY")
+            end
         end)
     NS.CB_AnchorAhead(loginTargetBtn, inviteTargetBtn)
 
@@ -398,7 +406,9 @@ NS.CleanBot_BuildManageTab = function()
         "Logout Target", 120, 24, function()
             local target = requireValidPlayerTarget()
             if not target then return end
-            SendChatMessage(".playerbots bot remove " .. target, "SAY")
+            if not NS.CB_AltArmyDisconnect(target) then
+                SendChatMessage(".playerbots bot remove " .. target, "SAY")
+            end
         end)
     NS.CB_AnchorAhead(logoutTargetBtn, uninviteTargetBtn)
 
@@ -722,6 +732,10 @@ NS.CleanBot_BuildManageTab = function()
         for _, v in ipairs(preset) do
             names[#names + 1] = titleCaseName(v)
         end
+        -- Bridge path: one BOT_CONNECT per name (GUIDs resolved by AltArmy), verdicts on the
+        -- wire. Only when there is no bridge does this fall back to the old single SAY, which
+        -- the server still answers with plain chat text.
+        if NS.CB_AltArmyConnectNames and NS.CB_AltArmyConnectNames(names) then return end
         SendChatMessage(".playerbots bot add " .. table.concat(names, ","), "SAY")
     end)
 
@@ -731,7 +745,11 @@ NS.CleanBot_BuildManageTab = function()
             NS.CB_Print("No bot selected.")
             return
         end
-        SendChatMessage(".playerbots bot add " .. titleCaseName(selected), "SAY")
+        -- Same request as Login Target, one name: RUN~BOT_CONNECT over the bridge, and
+        -- AltArmy types ".playerbots bot add <Name>" itself when there is none.
+        if not NS.CB_AltArmyConnect(titleCaseName(selected)) then
+            SendChatMessage(".playerbots bot add " .. titleCaseName(selected), "SAY")
+        end
     end)
 
     addPresetBtn:SetScript("OnClick", function()
@@ -891,10 +909,100 @@ NS.CleanBot_BuildManageTab = function()
 
     altbotsSection:Finalize(unlinkAltBtn)
 
+    -- ── Alt Army section ──────────────────────────────────────────────────────
+    -- Every alt on this account (GET~ALT_ROSTER) with login/logout per row and in bulk.
+    -- The snapshot, the lifecycle requests and their reason texts live in AltArmy.lua;
+    -- this is the list, four buttons and a status line. Single-alt actions fall back to
+    -- chat commands inside AltArmy when there is no bridge; bulk actions need the bridge
+    -- and say so rather than typing twenty commands.
+    local armySection = NS.CB_CreateSection(panel, "altArmy", "Alt Army", 3)
+
+    local selectedArmyGuid = nil   -- survives a refresh (re-selected by value)
+
+    local armyRefreshBtn = NS.CB_CreateButton(armySection.bg, "CleanBotArmyRefreshBtn",
+        "Refresh", 90, 24, function()
+            NS.CB_AltArmyRefresh("button")
+        end)
+    armyRefreshBtn:SetPoint("TOPLEFT", armySection.bg, "TOPLEFT",
+        NS.PADDING.section.left  + (armyRefreshBtn.marginLeft or 0),
+      -(NS.PADDING.section.top   + (armyRefreshBtn.marginTop  or 0)))
+
+    local armyConnectAllBtn = NS.CB_CreateButton(armySection.bg, "CleanBotArmyConnectAllBtn",
+        "Connect Offline", 112, 24, function()
+            NS.CB_AltArmyConnectAllOffline()
+        end)
+    NS.CB_AnchorAhead(armyConnectAllBtn, armyRefreshBtn)
+
+    local armyLogoutAllBtn = NS.CB_CreateButton(armySection.bg, "CleanBotArmyLogoutAllBtn",
+        "Logout Online", 112, 24, function()
+            NS.CB_AltArmyDisconnectAllOnline()
+        end)
+    NS.CB_AnchorAhead(armyLogoutAllBtn, armyConnectAllBtn)
+
+    -- Rows come pre-built from AltArmy (class-colored name, level, presence).
+    local armyList = NS.CB_CreateSelectList(armySection.bg, "CleanBotArmyList", 175, 104,
+        function(value) selectedArmyGuid = value end)
+    NS.CB_AnchorBelow(armyList, armyRefreshBtn)
+
+    -- 112, not 90: UIPanelButtonTemplate never resizes to its label, and "Logout Selected"
+    -- overflows 90 px. Matches "Connect Offline"/"Logout Online" in the row above.
+    local armyLoginBtn = NS.CB_CreateButton(armySection.bg, "CleanBotArmyLoginBtn",
+        "Login Selected", 112, 24, function()
+            if not selectedArmyGuid then
+                NS.CB_Print("No alt selected.")
+                return
+            end
+            NS.CB_AltArmyConnect(selectedArmyGuid)
+        end)
+    NS.CB_AnchorBelow(armyLoginBtn, armyList)
+
+    local armyLogoutBtn = NS.CB_CreateButton(armySection.bg, "CleanBotArmyLogoutBtn",
+        "Logout Selected", 112, 24, function()
+            if not selectedArmyGuid then
+                NS.CB_Print("No alt selected.")
+                return
+            end
+            NS.CB_AltArmyDisconnect(selectedArmyGuid)
+        end)
+    NS.CB_AnchorBelow(armyLogoutBtn, armyLoginBtn)
+
+    -- Snapshot summary under the buttons: counts, the partial marker, age, and what the
+    -- buttons do without a bridge. Full section width (Recruiter's status-label pattern)
+    -- so no sentence runs off the panel edge.
+    local armyStatus = NS.CB_CreateLabel(armySection.bg, "")
+    NS.CB_AnchorBelow(armyStatus, armyLogoutBtn)
+    armyStatus:SetPoint("RIGHT", armySection.bg, "RIGHT", -(armySection.bg.paddingRight or 8), 0)
+    armyStatus:SetJustifyH("LEFT")
+
+    -- Repaint from the model. preserveScroll + SetSelectedValue keep the reader's place
+    -- when a lifecycle result or refresh rebuilds the rows.
+    local function refreshArmyUI()
+        armyList:SetItems(NS.CB_AltArmyRows(), true)
+        if selectedArmyGuid then armyList:SetSelectedValue(selectedArmyGuid) end
+        armyStatus:SetText(NS.CB_AltArmyStatusText())
+    end
+
+    -- One subscription for the panel, replaced rather than stacked if the tab is rebuilt.
+    if NS.altArmyUIUnsubscribe then NS.altArmyUIUnsubscribe() end
+    NS.altArmyUIUnsubscribe = NS.CB_AltArmySubscribe(refreshArmyUI)
+
+    armySection:Finalize(armyStatus)      -- deepest col-1 widget
+    refreshArmyUI()                       -- paint whatever the cache already holds
+
+    -- Fetch on the first Manage tab open only; after that the Refresh button and the
+    -- action results keep it current, so an unopened panel costs no bridge traffic.
+    -- Registered once: rebuilding this tab would stack HookScript handlers on one frame.
+    if not NS.manageArmyAutoRefresh then
+        NS.manageArmyAutoRefresh = true
+        NS.managePanel:HookScript("OnShow", function()
+            if not NS.altArmy.fetchedAt then NS.CB_AltArmyRefresh("tab shown") end
+        end)
+    end
+
     -- ── Content height ────────────────────────────────────────────────────────
     local function updateContentHeight()
         local scrollTop  = NS.manageScrollChild:GetTop()
-        local lastAnchor = altbotsSection:GetAnchor()
+        local lastAnchor = armySection:GetAnchor()
         local lastBottom = lastAnchor and lastAnchor:GetBottom()
         if not (scrollTop and lastBottom) then return end
         local contentH = scrollTop - lastBottom
@@ -913,6 +1021,7 @@ NS.CleanBot_BuildManageTab = function()
             partyRaidSection:UpdateBackground()
             presetsSection:UpdateBackground()
             altbotsSection:UpdateBackground()
+            armySection:UpdateBackground()
             updateContentHeight()
         end)
     end
@@ -940,6 +1049,7 @@ NS.CleanBot_BuildManageTab = function()
         anchorToggle(partyRaidSection.toggleBtn, targetSection:GetAnchor())
         anchorToggle(presetsSection.toggleBtn,   partyRaidSection:GetAnchor())
         anchorToggle(altbotsSection.toggleBtn,   presetsSection:GetAnchor())
+        anchorToggle(armySection.toggleBtn,      altbotsSection:GetAnchor())
         scheduleUpdate()
     end
 
@@ -947,6 +1057,7 @@ NS.CleanBot_BuildManageTab = function()
     partyRaidSection.onToggle = reflow
     presetsSection.onToggle   = reflow
     altbotsSection.onToggle   = reflow
+    armySection.onToggle      = reflow
 
     reflow()
     scheduleUpdate()  -- initial deferred pass: backgrounds + height after first render
