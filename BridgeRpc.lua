@@ -581,6 +581,27 @@ local function CB_RequestWants(req, tag)
     return (not req.tags and not req.done) and tag ~= "ERR" or false
 end
 
+-- Finds the pending request an ERR belongs to when the server sent no token at all — which is what
+-- the bridge does for its generic rejections (ERR~GET~FORMATIONS~~UNKNOWN_GET passes an empty one).
+-- Without this the request sits out its whole timeout before the feature's whisper fallback runs.
+-- Only for an EMPTY token: an ERR naming a token we do not know belongs to a request already
+-- forgotten (timed out, cancelled) and must stay ignored. And only when exactly ONE in-flight
+-- request has that type, so an ambiguous error can never settle the wrong one by guesswork.
+---@param errType string|nil  Request type named by the ERR packet (fields[3]).
+---@return table|nil          The sole matching request, or nil when none or several match.
+local function CB_FindSoleRequestOfType(errType)
+    if not errType or errType == "" then return nil end
+
+    local wanted, found, matches = string.upper(errType), nil, 0
+    for _, req in pairs(pending) do
+        if not req.settled and not req.queued and string.upper(req.type or "") == wanted then
+            matches = matches + 1
+            found = req
+        end
+    end
+    return matches == 1 and found or nil
+end
+
 -- Finds the pending request a packet answers, preferring an exact token match.
 ---@param tag string      Inbound tag.
 ---@param fields table    Split packet.
@@ -641,6 +662,9 @@ NS.CB_RpcInbound = function(msg)
         if err.reason == "RATE_LIMIT" then NS.CB_BackoffRequest(err.type or "", RATE_WINDOW) end
 
         local req = err.token and pending[err.token]
+        if not req and (not err.token or err.token == "") then
+            req = CB_FindSoleRequestOfType(err.type)
+        end
         if req and not req.settled then
             CB_Settle(req, "error", fields)
         else

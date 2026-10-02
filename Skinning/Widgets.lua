@@ -315,7 +315,10 @@ end
 --
 -- Items are plain strings, or tables for decorated rows:
 --   { text = "Label", value = "key", class = "WARRIOR"|nil, gray = boolean|nil,
---     rightIcon = { texture = path, coords = {l,r,t,b} }|nil }
+--     rightIcon = { texture = path, coords = {l,r,t,b} }|nil, clampWidth = boolean|nil }
+-- clampWidth gives the label a right edge at the row border, so long text is cut off instead of
+-- drawing past the list. A plain label has no right anchor (that is what makes short rows look
+-- right), so this is opt-in: only lists that sit next to something else need it.
 -- class colors the label (RAID_CLASS_COLORS) and shows the class icon (left);
 -- gray renders the label 50% gray with no icon (e.g. a bot missing from the
 -- party/raid); rightIcon shows a texture right-aligned in the row (e.g. a role
@@ -443,6 +446,13 @@ NS.CB_CreateSelectList = function(parent, name, width, height, onSelect, multiSe
                     row.label:SetPoint("LEFT", row, "LEFT", 4, 0)
                 end
                 if rIcon then row.label:SetPoint("RIGHT", row.roleIcon, "LEFT", -4, 0) end
+                -- Opt-in clamp (see the item docs): a label with a width set is cut off at its right
+                -- edge rather than bleeding over whatever stands beside the list. Rows are recycled
+                -- and every pass clears the points first, so an item without the flag gets the old
+                -- unbounded anchor back.
+                if not rIcon and isTable and item.clampWidth then
+                    row.label:SetPoint("RIGHT", row, "RIGHT", -4, 0)
+                end
 
                 local classColor = isTable and item.class and RAID_CLASS_COLORS
                                    and RAID_CLASS_COLORS[item.class]

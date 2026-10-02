@@ -796,6 +796,55 @@ function CB_BuildInlineDropdown(section, s, yOffset, slot, tag, cmd, getSource, 
     return used + NS.MARGIN.dropdown.top + 32 + NS.MARGIN.dropdown.bottom, place, { hdr, dd }
 end
 
+-- ============================================================
+-- Read-only info line under a setting dropdown
+--
+-- A setting row shows one value; some settings also have a fact worth stating that is not itself
+-- changeable here (loot quality → the items each bot pins regardless of that quality). A FontString
+-- takes no mouse events, so the text lives inside a thin mouse-enabled frame that carries the tip.
+-- The row is repainted by the same refresher as the dropdown above it, so a bridge answer updates
+-- both at once. Its wording comes from NS[group.infoRow.view], which is where the states (not read /
+-- none / identical / differing) are decided — see Bridge.lua.
+-- ============================================================
+---@param col   table   Column frame to build into.
+---@param name  string  Frame name, unique in the addon.
+---@param group table   The settingDropdown definition carrying `infoRow = { title, view }`.
+---@param slot  table   The bound slot whose targets the row describes.
+---@return table         Row frame with .refresh stamped on it.
+local function CB_CreateInfoRow(col, name, group, slot)
+    local view = NS[group.infoRow.view]
+    local row  = CreateFrame("Frame", name, col)
+    row:EnableMouse(true)
+    row.marginTop    = NS.MARGIN.label.top
+    row.marginBottom = NS.MARGIN.label.bottom
+    row.marginLeft   = NS.MARGIN.label.left
+    row.marginRight  = NS.MARGIN.label.right
+    row._marginType  = "label"; NS.CB_RegisterStampable(row)
+
+    local title = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    title:SetPoint("LEFT", row, "LEFT", 0, 0)
+    title:SetText(group.infoRow.title .. ":")
+    local value = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    value:SetPoint("LEFT", title, "RIGHT", 4, 0)
+
+    row.refresh = function()
+        local keys = {}
+        for _, m in ipairs(CB_SlotTargets(slot)) do keys[#keys + 1] = m.key end
+        local text, tip = view(keys)
+        value:SetText(text)
+        row.tip = tip
+        -- The frame must cover its text to be hoverable; font metrics are only known after SetText.
+        local w = (title.GetStringWidth and title:GetStringWidth() or 0)
+                + (value.GetStringWidth and value:GetStringWidth() or 0) + 8
+        local h = math.max(title.GetStringHeight and title:GetStringHeight() or 0,
+                           value.GetStringHeight  and value:GetStringHeight()  or 0, 12)
+        row:SetSize(math.max(60, w), h)
+    end
+    NS.CB_SetTooltip(row, group.infoRow.title, function() return row.tip end)
+    row.refresh()
+    return row
+end
+
 -- Unique key for a roleDropdown's none-subsection (the subGroup with `none = true`, shown
 -- when no rotation token is set — the "DPS" default). A table sentinel can't collide with a
 -- strategy field name in the subSections / roleToSection maps.
@@ -1179,15 +1228,30 @@ local function CB_BuildColumnGroups(col, groups, cmd, slot, tag, startGi, regist
             end
             refresh()
             NS.commandRefreshers[#NS.commandRefreshers + 1] = refresh
+
+            -- Optional read-only line beneath the setting (loot quality → pinned items). It joins
+            -- the group's frame set and becomes the column's new bottom, so both the build-time walk
+            -- and CB_RelayoutColumn treat the pair as one node.
+            local tail = dd
+            if group.infoRow and NS[group.infoRow.view] then
+                local row = CB_CreateInfoRow(col,
+                    "CleanBotSetInfo_" .. cmd .. tag .. "_" .. (group.group or gi), group, slot)
+                NS.CB_AnchorBelow(row, dd)
+                NS.commandRefreshers[#NS.commandRefreshers + 1] = row.refresh
+                tail = row
+            end
+
             if isGenericGroup then
                 -- A command setting, not a class-gated strategy → always shown.
-                chain[#chain + 1] = {
+                local node = {
                     kind = "simple", groupKey = group.group, frames = { header, dd },
-                    anchorHead = makeAnchorHead(header), bottom = dd,
+                    anchorHead = makeAnchorHead(header), bottom = tail,
                     shown = function() return true end,
                 }
+                if tail ~= dd then node.frames[3] = tail end
+                chain[#chain + 1] = node
             end
-            prevBottom = dd
+            prevBottom = tail
 
         else
             -- Checkbox group — drop entries the bot's class doesn't register

@@ -1,11 +1,16 @@
 -- ============================================================
--- AltArmy.lua  —  every alt on this account, and the connect/logout actions for them.
+-- AltArmy.lua  —  every alt you can raise, and the connect/logout actions for them.
 --
 -- Data + action layer behind the Manage tab's "Alt Army" section. It owns two
 -- bridge endpoints and nothing else:
---   GET~ALT_ROSTER                        → BEGIN / ENTRY×n / END snapshot of the account
+--   GET~ALT_ROSTER                        → BEGIN / ENTRY×n / END snapshot of this account plus
+--                                            every account linked with `playerbots account link`
 --   RUN~BOT_CONNECT / RUN~BOT_DISCONNECT  → BOT_LIFECYCLE result for one alt
 -- plus GET~BOT_LIFECYCLE_STATE, used once per still-connecting alt to settle the row.
+--
+-- Plus the summon list: a hand-picked basket of these alts (no endpoint of its own — it is made of
+-- rows the snapshot already delivered) that "Login List" and "Logout List" run over BOT_CONNECT /
+-- BOT_DISCONNECT as one group. See "Summon list" below.
 --
 -- The wire itself is BridgeRpc.lua's job (tokens, timeouts, ERR routing, rate
 -- budgets, capability gate); this file only translates packets into a cached
@@ -14,8 +19,9 @@
 -- capability is missing; the bulk buttons have no such fallback and say so.
 --
 -- Server side: modules/mod-multibot-bridge/src/MultiBotBridge.cpp
---   ALT_ROSTER_ENTRY~<guid>~<url(name)>~<classId>~<level>~ONLINE|OFFLINE
---     (requester excluded, 128 entries max, truncated flag on the BEGIN/END framing)
+--   ALT_ROSTER_ENTRY~<guid>~<url(name)>~<classId>~<level>~ONLINE|OFFLINE~self|link:<url(account)>
+--     (requester excluded, 128 entries max, truncated flag on the BEGIN/END framing; the 7th field
+--     is optional and only says whose account the alt belongs to — see CB_ArmyEntry)
 --   BOT_LIFECYCLE~<token>~<guid>~<url(name)>~<action>~OK|PENDING|ERR~<reason>
 --     OK = settled (reason ONLINE / ALREADY_ONLINE / OFFLINE / ALREADY_OFFLINE);
 --     PENDING = accepted and still connecting (STARTED / ALREADY_CONNECTING)
@@ -36,6 +42,9 @@ local BULK_STAGGER          = 0.15
 -- A connect that answered PENDING is re-checked this many times, once per delay.
 local MAX_STATE_CHECKS      = 3
 local STATE_CHECK_DELAY     = 2.0
+-- How many linked account names the status line lists before collapsing to "...". The list widget
+-- is a few lines tall; an army spanning dozens of accounts still reports its size.
+local LINKED_NAMES_SHOWN    = 4
 
 -- Row states: ONLINE / OFFLINE / CONNECTING (transient, from a PENDING answer).
 NS.ALT_ARMY_ONLINE     = "ONLINE"
@@ -45,8 +54,9 @@ NS.ALT_ARMY_CONNECTING = "CONNECTING"
 -- Cached snapshot plus per-row live state. Rebuilt wholesale by a refresh;
 -- individual rows are then patched by lifecycle results.
 NS.altArmy = NS.altArmy or {
-    entries   = {},     -- array of { guid, name, class, level, state, note }
+    entries   = {},     -- array of { guid, name, class, level, state, note, account? }
     byGuid    = {},     -- [guid] = entry (the same tables held in entries)
+    selection = {},     -- the summon list: copies of rows, in the order they were added
     fetchedAt = nil,    -- GetTime() of the last completed snapshot (nil = never)
     truncated = false,  -- the server hit its entry cap: the list is partial
     source    = "none", -- "bridge" once a snapshot landed, else "unavailable"
@@ -162,6 +172,8 @@ end
 
 ---Drops the cached snapshot (relog / bridge reset), so nothing stale is shown.
 ---@param reason string|nil  Only used for the /cbdebug rpc trace.
+-- The summon list deliberately survives: it is user intent, not cached server state, and a relog
+-- (its only caller) keeps the same player. Rows that no longer resolve show "?" until removed.
 NS.CB_AltArmyReset = function(reason)
     NS.altArmy.entries, NS.altArmy.byGuid = {}, {}
     NS.altArmy.fetchedAt, NS.altArmy.truncated = nil, false
@@ -197,7 +209,20 @@ local function CB_ArmyBegin(fields)
     staging = { rows = {}, truncated = tonumber(fields[3]) == 1 }
 end
 
--- ALT_ROSTER_ENTRY~<guid>~<url(name)>~<classId>~<level>~ONLINE|OFFLINE
+---Whose account a roster row belongs to.
+---@param scope string|nil  The entry's optional 7th field ("self" | "link:<url(name)>" | nil).
+---@return string|nil       The linked account's name, or nil for the player's own account.
+local function CB_ScopeAccount(scope)
+    if type(scope) ~= "string" then return nil end
+    -- Prefix test on purpose: a username is free to contain anything the wire escaped, so only
+    -- "link:" is ours. An empty name after the prefix is treated as "own", never as a blank label.
+    if scope:sub(1, 5) ~= "link:" then return nil end
+    local account = NS.CB_UrlDecode(scope:sub(6))
+    if not account or account == "" then return nil end
+    return account
+end
+
+-- ALT_ROSTER_ENTRY~<guid>~<url(name)>~<classId>~<level>~ONLINE|OFFLINE~<scope>
 ---@param fields table  Split packet.
 local function CB_ArmyEntry(fields)
     staging = staging or { rows = {}, truncated = false }   -- tolerate a lost BEGIN
@@ -210,6 +235,11 @@ local function CB_ArmyEntry(fields)
         class = (NS.CLASS_ID_TOKENS and NS.CLASS_ID_TOKENS[tonumber(fields[4])]) or "WARRIOR",
         level = tonumber(fields[5]) or 0,
         state = (fields[6] == NS.ALT_ARMY_ONLINE) and NS.ALT_ARMY_ONLINE or NS.ALT_ARMY_OFFLINE,
+        -- Optional 7th field (ALT_ROSTER_LINKED_V1): "self", or "link:<account>" for an alt owned
+        -- by a linked account. Absent on an older bridge, which means the same thing "self" does —
+        -- your own account — so no capability check is needed here, and nothing else in the row
+        -- changes: connecting those alts already worked, they simply were not listed.
+        account = CB_ScopeAccount(fields[7]),
     }
 end
 
@@ -502,28 +532,19 @@ NS.CB_AltArmyDisconnect = function(target) return CB_ArmySetPresence("DISCONNECT
 
 -- ── Bulk runs (bridge-only: no chat-command fallback for these) ──────────────
 
--- Sends one request per matching row, staggered so a large army stays inside the
--- server's mutation window and the client's spam protection.
----@param action string  "CONNECT" (offline rows) | "DISCONNECT" (online rows).
----@return number        How many requests were scheduled.
-local function CB_ArmyBulk(action)
+-- Shared body of every bulk run: the queue lock, the staggered sends and the one summary line.
+-- Callers own the target list and its wording, which is why "connect everything offline" and
+-- "log in this basket" are separate functions below rather than flags here.
+---@param action  string  "CONNECT" | "DISCONNECT".
+---@param targets table[]  Rows to act on; each must carry .guid.
+---@return number          How many requests were scheduled (0 when nothing was).
+local function CB_ArmyBulkRun(action, targets)
     if not CB_ArmyBridgeReady() then
         NS.CB_Print("Alt Army: bulk actions need the bridge (BOT_LIFECYCLE).")
         return 0
     end
     if bulkRun then
         NS.CB_Print("Alt Army: a bulk action is still running - wait for it to finish.")
-        return 0
-    end
-
-    local want   = (action == "CONNECT") and NS.ALT_ARMY_OFFLINE or NS.ALT_ARMY_ONLINE
-    local targets = {}
-    for _, entry in ipairs(NS.altArmy.entries) do
-        if entry.state == want then targets[#targets + 1] = entry end
-    end
-    if #targets == 0 then
-        NS.CB_Print(action == "CONNECT" and "Alt Army: no offline alts to connect."
-                                        or "Alt Army: no online alts to disconnect.")
         return 0
     end
 
@@ -534,6 +555,35 @@ local function CB_ArmyBulk(action)
         NS.CB_After((i - 1) * BULK_STAGGER, function() CB_ArmyMutate(action, entry) end)
     end
     return #targets
+end
+
+-- The roster-wide variant: every row in the given state.
+---@param action string  "CONNECT" (offline rows) | "DISCONNECT" (online rows).
+---@return number        How many requests were scheduled.
+local function CB_ArmyBulk(action)
+    local want    = (action == "CONNECT") and NS.ALT_ARMY_OFFLINE or NS.ALT_ARMY_ONLINE
+    local targets = {}
+    for _, entry in ipairs(NS.altArmy.entries) do
+        if entry.state == want then targets[#targets + 1] = entry end
+    end
+    if #targets == 0 then
+        NS.CB_Print(action == "CONNECT" and "Alt Army: no offline alts to connect."
+                                        or "Alt Army: no online alts to disconnect.")
+        return 0
+    end
+    return CB_ArmyBulkRun(action, targets)
+end
+
+---How many rows a bulk button would touch if pressed right now. The confirm dialog needs the
+---number before anything is sent, and zero means "do not ask about nothing".
+---@param action string  "CONNECT" (offline rows) | "DISCONNECT" (online rows).
+---@return number
+NS.CB_AltArmyBulkPlan = function(action)
+    local want, count = (action == "CONNECT") and NS.ALT_ARMY_OFFLINE or NS.ALT_ARMY_ONLINE, 0
+    for _, entry in ipairs(NS.altArmy.entries) do
+        if entry.state == want then count = count + 1 end
+    end
+    return count
 end
 
 ---Connects every cached alt that is currently offline (bridge only).
@@ -576,6 +626,121 @@ end
 ---@return number  How many requests were scheduled.
 NS.CB_AltArmyDisconnectAllOnline = function() return CB_ArmyBulk("DISCONNECT") end
 
+-- ── Summon list ──────────────────────────────────────────────────────────────
+-- A hand-picked basket of alts that the Manage tab fills with ">" and empties with "<<", and that
+-- "Login List" / "Logout List" then act on as one group. It exists because the roster is sorted by
+-- presence and level: the twelve alts you want to raise together are scattered through a scrolling
+-- list, and bulk-connecting everything was the only alternative.
+--
+-- Rows are *copies* of roster rows, so the basket survives a refresh and keeps an alt that has
+-- dropped out of the snapshot. Their state is deliberately never copied: it is read from the live
+-- cache when the list paints, so a row greys out when its character logs off instead of freezing as
+-- it was when ">" was pressed. In memory only — a working selection for this session, not SavedVars.
+
+---@param entry table  Roster row to copy into the basket.
+---@return table       The stored row (only the fields the list and the wire need).
+local function CB_SelectionCopy(entry)
+    return {
+        guid = entry.guid, name = entry.name, class = entry.class,
+        level = entry.level or 0, account = entry.account,
+    }
+end
+
+---How many alts are waiting in the summon list.
+---@return number
+NS.CB_AltArmySelectionCount = function() return #NS.altArmy.selection end
+
+---@param guid number|nil  Low GUID to look for.
+---@return number|nil      Position in the basket, or nil when it is not there.
+local function CB_SelectionIndex(guid)
+    if not guid then return nil end
+    for i, row in ipairs(NS.altArmy.selection) do
+        if row.guid == guid then return i end
+    end
+    return nil
+end
+
+---@param guid number  Low GUID of a stored row.
+---@return boolean     Whether that alt is already in the basket.
+NS.CB_AltArmySelectionHas = function(guid) return CB_SelectionIndex(guid) ~= nil end
+
+---Puts one alt in the summon list.
+---@param target table|number|string  Row, low GUID, or character name.
+---@return boolean  Whether it was added.
+---@return string   "added" | "duplicate" | "unknown" — the caller words the feedback.
+NS.CB_AltArmySelectionAdd = function(target)
+    local entry = CB_ResolveArmyTarget(target)
+    if not entry or not entry.guid then return false, "unknown" end
+    if CB_SelectionIndex(entry.guid) then return false, "duplicate" end
+    NS.altArmy.selection[#NS.altArmy.selection + 1] = CB_SelectionCopy(entry)
+    CB_NotifyArmy()
+    return true, "added"
+end
+
+---Adds every alt in the current snapshot that is not already listed (">>").
+---@return number  How many were added — 0 when nothing was fetched or all were present.
+NS.CB_AltArmySelectionAddAll = function()
+    local added = 0
+    for _, entry in ipairs(NS.altArmy.entries) do
+        if entry.guid and not CB_SelectionIndex(entry.guid) then
+            NS.altArmy.selection[#NS.altArmy.selection + 1] = CB_SelectionCopy(entry)
+            added = added + 1
+        end
+    end
+    if added > 0 then CB_NotifyArmy() end
+    return added
+end
+
+-- Removal takes a GUID, not a target: an alt that has left the snapshot must still be removable,
+-- and resolving through the roster would report it as unknown.
+---Takes one alt out of the summon list.
+---@param target number|table  Low GUID, or a stored row.
+---@return boolean             Whether anything was removed.
+NS.CB_AltArmySelectionRemove = function(target)
+    local guid = (type(target) == "number") and target
+              or (type(target) == "table" and target.guid or nil)
+    local index = CB_SelectionIndex(guid)
+    if not index then return false end
+    table.remove(NS.altArmy.selection, index)
+    CB_NotifyArmy()
+    return true
+end
+
+---Empties the summon list ("<<").
+---@return number  How many rows were dropped.
+NS.CB_AltArmySelectionClear = function()
+    local count = #NS.altArmy.selection
+    NS.altArmy.selection = {}
+    if count > 0 then CB_NotifyArmy() end
+    return count
+end
+
+-- One bulk run over the basket. Rows go through the live snapshot when the alt is still in it, so
+-- the request and its row patches land on the model the UI reads; an alt that left the snapshot is
+-- acted on through its stored copy, which carries the same GUID.
+---@param action string  "CONNECT" | "DISCONNECT".
+---@return number        How many requests were scheduled.
+local function CB_ArmySelectionBulk(action)
+    if #NS.altArmy.selection == 0 then
+        NS.CB_Print("Alt Army: the summon list is empty - add alts with \">\" first.")
+        return 0
+    end
+    local targets = {}
+    for _, row in ipairs(NS.altArmy.selection) do
+        targets[#targets + 1] = NS.altArmy.byGuid[row.guid] or row
+    end
+    return CB_ArmyBulkRun(action, targets)
+end
+
+---Logs every alt in the summon list in ("Login List", bridge only, staggered like the other runs).
+---@return number  How many requests were scheduled.
+NS.CB_AltArmySelectionLogin = function() return CB_ArmySelectionBulk("CONNECT") end
+
+---Logs every alt in the summon list out ("Logout List"). Already-offline rows answer
+---ALREADY_OFFLINE, which counts as settled: the list is a wish, and it is now fulfilled.
+---@return number  How many requests were scheduled.
+NS.CB_AltArmySelectionLogout = function() return CB_ArmySelectionBulk("DISCONNECT") end
+
 -- ── View helpers (used by the Manage tab's Alt Army section) ─────────────────
 
 local STATE_TEXT  = { ONLINE = "online", OFFLINE = "offline", CONNECTING = "connecting..." }
@@ -586,6 +751,26 @@ local STATE_COLOR = {
     ONLINE = "5ec25e", OFFLINE = "999999", CONNECTING = "e6c84b",
 }
 
+---How many listed alts belong to a linked account, grouped by account name.
+---@return number         How many rows are foreign (0 on a bridge without ALT_ROSTER_LINKED_V1).
+---@return table          Array of { name = string, count = n }, most populous first.
+NS.CB_AltArmyLinkedSummary = function()
+    local counts, groups, total = {}, {}, 0
+    for _, entry in ipairs(NS.altArmy.entries) do
+        local account = entry.account
+        if account then
+            total = total + 1
+            counts[account] = (counts[account] or 0) + 1
+        end
+    end
+    for name, count in pairs(counts) do groups[#groups + 1] = { name = name, count = count } end
+    table.sort(groups, function(a, b)
+        if a.count ~= b.count then return a.count > b.count end
+        return a.name < b.name
+    end)
+    return total, groups
+end
+
 ---List items for CB_CreateSelectList: class-colored name, level and presence.
 ---Offline rows are grayed by the list widget (item.gray); the state word carries
 ---the detail, so a row never depends on color alone.
@@ -594,14 +779,42 @@ NS.CB_AltArmyRows = function()
     local items = {}
     for _, entry in ipairs(NS.altArmy.entries) do
         local state = entry.state or NS.ALT_ARMY_OFFLINE
+        -- A linked account is named on the row, not left to be inferred: "Connect" here raises a
+        -- character off somebody else's account, and that should be visible before it is clicked.
         items[#items + 1] = {
-            text  = string.format("%s |cffaaaaaa%d|r |cff%s%s|r",
+            text  = string.format("%s |cffaaaaaa%d|r |cff%s%s|r%s",
                 entry.name or "?", entry.level or 0,
                 STATE_COLOR[state] or "999999",
-                STATE_TEXT[state] or string.lower(state)),
+                STATE_TEXT[state] or string.lower(state),
+                entry.account and string.format(" |cff8080ff@%s|r", entry.account) or ""),
             value = entry.guid,
             class = entry.class,
             gray  = (state == NS.ALT_ARMY_OFFLINE),
+            -- The list shares its row with a second list beside it now, and a plain label has no
+            -- right anchor: a long name + account would draw over the transfer buttons.
+            clampWidth = true,
+        }
+    end
+    return items
+end
+
+---List items for the summon list. Narrower than the roster column, so it carries name and level
+---only: presence is told by greying (same convention as the roster list) and the status line gives
+---the count. A row whose alt is no longer in the snapshot keeps its place and gains a "?" — that
+---alt can still be logged in by GUID, and "why not this one?" needs answering before the click.
+---@return table  Array of { text = string, value = guid, class = token, gray = bool }.
+NS.CB_AltArmySelectionRows = function()
+    local items = {}
+    for _, row in ipairs(NS.altArmy.selection) do
+        local live  = NS.altArmy.byGuid[row.guid]
+        local state = live and live.state or nil
+        items[#items + 1] = {
+            text  = string.format("%s |cffaaaaaa%d|r%s", row.name or "?", row.level or 0,
+                live and "" or " |cffffa54e?|r"),
+            value = row.guid,
+            class = row.class,
+            gray  = (state ~= NS.ALT_ARMY_ONLINE),
+            clampWidth = true,
         }
     end
     return items
@@ -633,6 +846,21 @@ NS.CB_AltArmyStatusText = function()
     end
 
     local lines = { string.format("%d alt(s), %d online", #army.entries, NS.CB_AltArmyOnlineCount()) }
+    -- Linked accounts are listed by default, so say so: a row that turns out to belong to another
+    -- account is otherwise indistinguishable from a bug in the roster.
+    local linked, linkedGroups = NS.CB_AltArmyLinkedSummary()
+    if linked > 0 then
+        local named, shown = {}, math.min(#linkedGroups, LINKED_NAMES_SHOWN)
+        for i = 1, shown do named[i] = string.format("%s (%d)", linkedGroups[i].name, linkedGroups[i].count) end
+        if #linkedGroups > shown then named[#named + 1] = "..." end
+        lines[#lines + 1] = "|cff8080ffIncludes " .. linked .. " alt(s) from linked account(s): "
+            .. table.concat(named, ", ") .. ".|r"
+    end
+    -- The basket is independent of the snapshot, so its size has to be reported here: with alts
+    -- parked in it and nothing selected, "Logout Online" looks like it would act on them.
+    if army.selection and #army.selection > 0 then
+        lines[#lines + 1] = string.format("|cff808080Summon list: %d alt(s).|r", #army.selection)
+    end
     -- The server caps the snapshot and only says so through this flag.
     if army.truncated then
         lines[#lines + 1] = "|cffffa54ePartial list (server entry cap).|r"

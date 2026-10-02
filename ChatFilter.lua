@@ -5,6 +5,11 @@
 -- parsing every line — we only stop the user-facing echo of the commands we send
 -- and the replies we consume.
 --
+-- Three things are hidden: our own command echo, a bot's machine-format replies to our queries,
+-- and a bot's bare acknowledgement of an order ("Ok.") — the last one both as a whisper and on the
+-- group channel it arrived on. See BOT_REPLY_PREFIXES and ACK_LINES below for the exact rules and
+-- why each is considered safe.
+--
 -- Gated on NS.hideBotChatter (Settings → "Hide Bot Chatter", default on; toggle off
 -- to see raw traffic for testing). Read live on each call, so no /reload is needed.
 -- ============================================================
@@ -93,13 +98,86 @@ local function filterGroup(_, _, msg, sender)
     end)
 end
 
+-- Machine-format replies we consume ourselves, listed by their exact server-side output prefix.
+-- The reply window above is a timing heuristic and it leaks in two ways: a busy bot answers more
+-- than WHISPER_SILENCE apart, and a query can print MORE lines than the one we parse. "ll ?" is
+-- the standing example — it sends the strategy line and then the always-loot list, of which only
+-- the first is parsed, so the tail line showed as chatter whenever the two arrived far apart.
+-- These prefixes are emitted ONLY by the bot AI's command handlers (never by a human, and never
+-- by a bot's free-form/greeting chat), so they are safe to hide from a bot we manage even with no
+-- window open — which is what keeps a playerbots text change from turning our own queries back
+-- into user-visible spam:
+--   "Loot strategy:" / "Always loot items:"  LootStrategyAction's `?` answer (two lines)
+--   "Loot strategy set to"                   same action, set form
+--   "Formation:"                              SetFormationAction (`formation ?` / no-arg)
+local BOT_REPLY_PREFIXES = {
+    "Loot strategy:",
+    "Loot strategy set to",
+    "Always loot items:",
+    "Formation:",
+}
+
+---@param msg string|nil  Whisper body as received (colour codes are stripped by senders, not here).
+---@return boolean        Whether the line matches one of our command-reply signatures.
+local function isBotReplySignature(msg)
+    if not msg then return false end
+    for _, prefix in ipairs(BOT_REPLY_PREFIXES) do
+        if strsub(msg, 1, #prefix) == prefix then return true end
+    end
+    return false
+end
+
+-- Bare acknowledgements: "Ok.", "Done.", "As you wish." A bot answers an order with one of these,
+-- so a 20-bot group produces 20 lines — and the reply window cannot cover them all, because a busy
+-- group drains its command queue over many seconds (CB_MAX_PER_SECOND) while each window is only
+-- WHISPER_SILENCE long. Worse, an order sent on a group channel gets its answers back on that same
+-- channel, which the whisper filter never sees.
+--
+-- Unlike BOT_REPLY_PREFIXES these are ordinary words a human says too, so the blast radius is kept
+-- deliberately small:
+--   • only senders in CleanBot_PartyBots (bots WE manage) — never a plain group/raid member;
+--   • only when the ENTIRE line is the acknowledgement, so "Ok, but the bag is empty" and a greeting
+--     like "Ok who wants loot" stay visible;
+--   • still gated on NS.hideBotChatter, so Settings can turn all of this off.
+-- Unsolicited bot chat with no command behind it keeps showing except for these one-word acks, which
+-- carry no information the player needs: CleanBot prints its own feedback for every order it sends.
+local ACK_LINES = {
+    ["ok"] = true, ["okay"] = true, ["k"] = true, ["done"] = true, ["on it"] = true,
+    ["got it"] = true, ["gotcha"] = true, ["will do"] = true, ["consider it done"] = true,
+    ["as you wish"] = true, ["sure"] = true, ["sure thing"] = true, ["no problem"] = true,
+    ["no worries"] = true, ["you got it"] = true, ["right away"] = true, ["understood"] = true,
+    ["affirmative"] = true, ["yes sir"] = true, ["yep"] = true,
+}
+-- Acks are short; anything longer is a sentence and gets shown without further work.
+local ACK_MAX_LEN = 32
+
+--- Normalise then test for a whole-line acknowledgement (case, padding, trailing punctuation and
+--- colour codes are all irrelevant to the verdict).
+---@param msg string|nil
+---@return boolean
+local function isAckLine(msg)
+    if not msg then return false end
+    -- Cheap pre-filter on the raw line (filters run per chat window per line); the real limit is
+    -- applied to the stripped text, since colour codes add up to 10 bytes each.
+    if #msg > ACK_MAX_LEN * 3 then return false end
+    -- string methods rather than more str* aliases: only strlower/strsub/strmatch have precedent here.
+    -- Colour codes are exactly "|c" + 8 hex digits. Do NOT use |c%x+ here: it is greedy and "Done",
+    -- "Face" or "Cafe" start with hex letters, so it would eat the word along with the code.
+    local text = strlower((msg:gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", "")))
+    text = text:match("^%s*(.-)%s*$")
+    -- Strip trailing punctuation the bot's reply may carry ("Ok.", "ok!!", "Done...").
+    text = text:match("^(.-)[%s%.!%,~]+$") or text
+    if #text > ACK_MAX_LEN then return false end
+    return ACK_LINES[text] == true
+end
+
 -- Incoming: hide a bot's reply while its command-reply window is open (see CB_MarkExpectReply
 -- in Bridge.lua). The window opens when we whisper a command and is slid forward by one
 -- WHISPER_SILENCE on each reply line, so it brackets the whole burst — one ack or a long
 -- streamed dump — and closes once the bot goes quiet. Unsolicited bot greetings (a bot's
 -- readiness whisper, with no command before it) are intentionally NOT hidden: their text
 -- varies and isn't distinguishable from a human's, so they show once on join.
-local function filterWhisper(_, _, _, sender)
+local function filterWhisper(_, _, msg, sender)
     if not enabled() or not suppressibleParty(sender) then return false end
     local key = strlower(sender)
     local deadline = NS.botReplyWindow and NS.botReplyWindow[key]
@@ -107,7 +185,36 @@ local function filterWhisper(_, _, _, sender)
         NS.botReplyWindow[key] = GetTime() + NS.WHISPER_SILENCE   -- slide to keep bracketing the burst
         return true
     end
+
+    -- Window already closed but the text is unmistakably one of our own command replies: hide it,
+    -- and re-open the window while we're at it, so the remaining lines of that same answer are
+    -- swallowed by the fast path above instead of leaking one by one. Scoped to bots in our own
+    -- roster (not merely any group member) to keep the blast radius small.
+    if CleanBot_PartyBots[key] and isBotReplySignature(msg) then
+        NS.botReplyWindow[key] = GetTime() + NS.WHISPER_SILENCE
+        return true
+    end
+
+    -- Ack from a bot we manage, arriving after its window closed: hide it and re-open the window,
+    -- so the rest of a slow-draining queue is swallowed by the fast path above instead of leaking
+    -- one "Ok." at a time.
+    if CleanBot_PartyBots[key] and isAckLine(msg) then
+        NS.botReplyWindow[key] = GetTime() + NS.WHISPER_SILENCE
+        return true
+    end
     return false
+end
+
+-- Incoming group traffic: acknowledgements to an order we broadcast come back on the SAME channel
+-- (party/raid), so they are invisible to the whisper filter above and used to print one line per
+-- bot. Registered as a second filter on these events, after filterGroup (which handles our own
+-- echo), so neither path has to know about the other.
+local groupAckSeen = {}
+local function filterGroupAck(_, _, msg, sender)
+    if not enabled() then return false end
+    if not CleanBot_PartyBots[strlower(sender or "")] then return false end
+    if not isAckLine(msg) then return false end
+    return replayable(groupAckSeen, strlower(sender) .. "\0" .. msg, function() return true end)
 end
 
 -- System: hide the server output CleanBot triggers and already parses — the self-bot
@@ -199,3 +306,9 @@ ChatFrame_AddMessageEventFilter("CHAT_MSG_PARTY",          filterGroup)
 ChatFrame_AddMessageEventFilter("CHAT_MSG_PARTY_LEADER",   filterGroup)
 ChatFrame_AddMessageEventFilter("CHAT_MSG_RAID",           filterGroup)
 ChatFrame_AddMessageEventFilter("CHAT_MSG_RAID_LEADER",    filterGroup)
+-- Bot acknowledgements on group channels (see filterGroupAck). Filters chain: ours runs after
+-- filterGroup, which only ever consumes lines WE sent.
+ChatFrame_AddMessageEventFilter("CHAT_MSG_PARTY",          filterGroupAck)
+ChatFrame_AddMessageEventFilter("CHAT_MSG_PARTY_LEADER",   filterGroupAck)
+ChatFrame_AddMessageEventFilter("CHAT_MSG_RAID",           filterGroupAck)
+ChatFrame_AddMessageEventFilter("CHAT_MSG_RAID_LEADER",    filterGroupAck)

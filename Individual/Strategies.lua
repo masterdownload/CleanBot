@@ -392,6 +392,11 @@ NS.NC_STRATEGIES = {
         type    = "settingDropdown",
         cmd     = "ll",
         field   = "lootStrategy",
+        -- Read-only line under the dropdown: which items each target pins regardless of its quality
+        -- (the always-loot list the LOOT_READ_V1 sweep caches in entry.alwaysLootItems). `view` is a
+        -- NAME rather than the function so this file does not depend on Bridge.lua having loaded
+        -- first; Individual.lua resolves it and skips the row if it is missing. See Bridge.lua.
+        infoRow = { title = "Always Loot", view = "CB_AlwaysLootView" },
         options = {
             { value = "all",        name = "All",        desc = "Loot everything on the corpse" },
             { value = "normal",     name = "Normal",     desc = "Loot items with a use or sell value — includes most gray junk (Default)" },

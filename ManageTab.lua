@@ -910,14 +910,51 @@ NS.CleanBot_BuildManageTab = function()
     altbotsSection:Finalize(unlinkAltBtn)
 
     -- ── Alt Army section ──────────────────────────────────────────────────────
-    -- Every alt on this account (GET~ALT_ROSTER) with login/logout per row and in bulk.
-    -- The snapshot, the lifecycle requests and their reason texts live in AltArmy.lua;
-    -- this is the list, four buttons and a status line. Single-alt actions fall back to
-    -- chat commands inside AltArmy when there is no bridge; bulk actions need the bridge
-    -- and say so rather than typing twenty commands.
+    -- Left column: every alt you can raise (GET~ALT_ROSTER), with login/logout per row and in bulk.
+    -- Right column: the summon list — a hand-picked set of those alts, filled with ">" / ">>" and run
+    -- as one group by "Login List" / "Logout List". The snapshot, the lifecycle requests and their
+    -- reason texts live in AltArmy.lua; this is the two lists, the transfer buttons, the
+    -- confirmations and a status line. Single-alt actions fall back to chat commands inside AltArmy
+    -- when there is no bridge; bulk actions need the bridge and say so rather than typing twenty.
     local armySection = NS.CB_CreateSection(panel, "altArmy", "Alt Army", 3)
 
-    local selectedArmyGuid = nil   -- survives a refresh (re-selected by value)
+    local selectedArmyGuid   = nil   -- survives a refresh (re-selected by value)
+    local selectedSummonGuid = nil
+
+    -- Column geometry: [roster list] [> >> < <<] [summon list]. The transfer column is fixed width
+    -- and the two lists split whatever is left. CB_CreateSection sizes the section background only
+    -- after the first layout pass (until then it is a 2000px placeholder), so DEFAULT_LIST_W is a
+    -- start value and sizeArmyColumns() applies the real widths once geometry exists.
+    local TRANSFER_W     = 40
+    local LIST_H         = 116
+    local DEFAULT_LIST_W = 150
+
+    -- Raising or logging out an entire army is something you only notice afterwards — bots stop
+    -- mid-grind — so both roster-wide buttons confirm first, naming how many they are about to
+    -- touch. A press with nothing to do skips the dialog and runs straight through: "no offline
+    -- alts" is the useful answer there, not a popup about nothing.
+    NS.CB_RegisterConfirmPopup("CLEANBOT_ARMY_CONNECT_ALL",
+        "Connect every offline alt as a bot? This raises %s character(s).",
+        function() NS.CB_AltArmyConnectAllOffline() end)
+    NS.CB_RegisterConfirmPopup("CLEANBOT_ARMY_LOGOUT_ALL",
+        "Log out every online alt? %s character(s) stop whatever they are doing.",
+        function() NS.CB_AltArmyDisconnectAllOnline() end)
+
+    ---@param key    string  One of the popups registered above.
+    ---@param action string  "CONNECT" | "DISCONNECT" — the verb the button shows.
+    local function confirmArmyBulk(key, action)
+        local count = NS.CB_AltArmyBulkPlan(action)
+        if count == 0 then
+            if action == "CONNECT" then NS.CB_AltArmyConnectAllOffline()
+            else NS.CB_AltArmyDisconnectAllOnline() end
+            return
+        end
+        local popup = StaticPopup_Show(key, tostring(count))
+        if popup then
+            popup:SetWidth(420)
+            popup.text:SetWidth(380)
+        end
+    end
 
     local armyRefreshBtn = NS.CB_CreateButton(armySection.bg, "CleanBotArmyRefreshBtn",
         "Refresh", 90, 24, function()
@@ -929,20 +966,134 @@ NS.CleanBot_BuildManageTab = function()
 
     local armyConnectAllBtn = NS.CB_CreateButton(armySection.bg, "CleanBotArmyConnectAllBtn",
         "Connect Offline", 112, 24, function()
-            NS.CB_AltArmyConnectAllOffline()
+            confirmArmyBulk("CLEANBOT_ARMY_CONNECT_ALL", "CONNECT")
         end)
     NS.CB_AnchorAhead(armyConnectAllBtn, armyRefreshBtn)
 
     local armyLogoutAllBtn = NS.CB_CreateButton(armySection.bg, "CleanBotArmyLogoutAllBtn",
         "Logout Online", 112, 24, function()
-            NS.CB_AltArmyDisconnectAllOnline()
+            confirmArmyBulk("CLEANBOT_ARMY_LOGOUT_ALL", "DISCONNECT")
         end)
     NS.CB_AnchorAhead(armyLogoutAllBtn, armyConnectAllBtn)
 
     -- Rows come pre-built from AltArmy (class-colored name, level, presence).
-    local armyList = NS.CB_CreateSelectList(armySection.bg, "CleanBotArmyList", 175, 104,
+    local armyList = NS.CB_CreateSelectList(armySection.bg, "CleanBotArmyList", DEFAULT_LIST_W, LIST_H,
         function(value) selectedArmyGuid = value end)
     NS.CB_AnchorBelow(armyList, armyRefreshBtn)
+
+    -- ── Transfer column: move alts between the two lists ───────────────────────
+    -- Glyphs because the column is 40px wide; ">"/"<" take the selected row and ">>","<<" the whole
+    -- roster / the whole basket. CB_AnchorBelow would snap each button back to the section's left
+    -- wall (it anchors LEFT to the parent), so the stack is anchored by hand and recorded through
+    -- CB_Anchor, which is what makes it survive a padding change.
+    local function anchorUnder(widget, above)
+        NS.CB_Anchor(widget, function()
+            widget:ClearAllPoints()
+            local gap = (above.marginBottom or 0) + (widget.marginTop or 0)
+            widget:SetPoint("TOPLEFT", above, "BOTTOMLEFT", 0, -gap)
+        end)
+    end
+
+    local armySelAddBtn = NS.CB_CreateButton(armySection.bg, "CleanBotArmySelAddBtn", ">",
+        TRANSFER_W, 24, function()
+            if not selectedArmyGuid then
+                NS.CB_Print("Alt Army: select an alt to add.")
+                return
+            end
+            local _, why = NS.CB_AltArmySelectionAdd(selectedArmyGuid)
+            if why == "duplicate" then
+                NS.CB_Print("Alt Army: that alt is already in the summon list.")
+            end
+        end)
+    NS.CB_Anchor(armySelAddBtn, function()
+        armySelAddBtn:ClearAllPoints()
+        armySelAddBtn:SetPoint("TOPLEFT", armyList, "TOPRIGHT",
+            NS.COLUMN_GAP + (armySelAddBtn.marginLeft or 0), 0)
+    end)
+
+    local armySelAddAllBtn = NS.CB_CreateButton(armySection.bg, "CleanBotArmySelAddAllBtn", ">>",
+        TRANSFER_W, 24, function()
+            local added = NS.CB_AltArmySelectionAddAll()
+            NS.CB_Print(added > 0
+                and string.format("Alt Army: %d alt(s) added to the summon list.", added)
+                or  "Alt Army: nothing new to add.")
+        end)
+    anchorUnder(armySelAddAllBtn, armySelAddBtn)
+
+    local armySelRemoveBtn = NS.CB_CreateButton(armySection.bg, "CleanBotArmySelRemoveBtn", "<",
+        TRANSFER_W, 24, function()
+            if not selectedSummonGuid then
+                NS.CB_Print("Alt Army: select an alt in the summon list.")
+                return
+            end
+            if NS.CB_AltArmySelectionRemove(selectedSummonGuid) then
+                -- The row is gone, so the selection is stale; the next click picks a new one.
+                selectedSummonGuid = nil
+            end
+        end)
+    anchorUnder(armySelRemoveBtn, armySelAddAllBtn)
+
+    local armySelClearBtn = NS.CB_CreateButton(armySection.bg, "CleanBotArmySelClearBtn", "<<",
+        TRANSFER_W, 24, function()
+            local dropped = NS.CB_AltArmySelectionClear()
+            selectedSummonGuid = nil
+            NS.CB_Print(dropped > 0
+                and string.format("Alt Army: summon list emptied (%d removed).", dropped)
+                or  "Alt Army: the summon list is already empty.")
+        end)
+    anchorUnder(armySelClearBtn, armySelRemoveBtn)
+
+    NS.CB_SetTooltip(armySelAddBtn, "Add selected",
+        "Move the alt selected in the army list into the summon list.")
+    NS.CB_SetTooltip(armySelAddAllBtn, "Add all",
+        "Add every alt in the army list that is not already in the summon list.")
+    NS.CB_SetTooltip(armySelRemoveBtn, "Remove selected",
+        "Take the alt selected in the summon list back out.")
+    NS.CB_SetTooltip(armySelClearBtn, "Remove all",
+        "Empty the summon list. Nothing is logged in or out - it only clears the selection.")
+
+    -- ── Summon column: the basket Login/Logout List act on ────────────────────
+    local summonList = NS.CB_CreateSelectList(armySection.bg, "CleanBotArmySummonList",
+        DEFAULT_LIST_W, LIST_H, function(value) selectedSummonGuid = value end)
+    NS.CB_Anchor(summonList, function()
+        summonList:ClearAllPoints()
+        summonList:SetPoint("TOPLEFT", armySelAddBtn, "TOPRIGHT",
+            NS.COLUMN_GAP + (summonList.marginLeft or 0), 0)
+    end)
+    -- The container needs the mouse to show a tip at all (CB_AttachTooltip only wires OnEnter/OnLeave,
+    -- and single-select lists do not enable it). Rows are above it, so they keep their own clicks.
+    summonList:EnableMouse(true)
+    NS.CB_SetTooltip(summonList, "Summon list",
+        "Alts you picked out of the army list. Rows stay here even when a refresh drops them; a '?' " ..
+        "row is not in the current snapshot but can still be logged in.")
+
+    local summonLoginBtn = NS.CB_CreateButton(armySection.bg, "CleanBotArmySummonLoginBtn",
+        "Login List", 112, 24, function()
+            NS.CB_AltArmySelectionLogin()
+        end)
+    anchorUnder(summonLoginBtn, summonList)
+
+    local summonLogoutBtn = NS.CB_CreateButton(armySection.bg, "CleanBotArmySummonLogoutBtn",
+        "Logout List", 112, 24, function()
+            NS.CB_AltArmySelectionLogout()
+        end)
+    anchorUnder(summonLogoutBtn, summonLoginBtn)
+
+    -- Both columns size to the same width so the section reads as two lists, not a list and a
+    -- column of leftovers. Called after the first render (see scheduleUpdate) and on reflow.
+    local function sizeArmyColumns()
+        local bgW = armySection.bg:GetWidth() or 0
+        if bgW < 320 then return end       -- placeholder width: keep the start values
+        local usable = bgW - (NS.PADDING.section.left or 0) - (armySection.bg.paddingRight or 8) - 4
+        -- Two containers share what the transfer column and its two gaps leave over.
+        local containerW = math.floor((usable - TRANSFER_W - 2 * NS.COLUMN_GAP) / 2)
+        containerW = math.max(containerW, DEFAULT_LIST_W + 20)
+        armyList:SetWidth(containerW)
+        summonList:SetWidth(containerW)
+        for _, btn in ipairs({ summonLoginBtn, summonLogoutBtn }) do
+            btn:SetWidth(math.max(containerW - 20, 96))
+        end
+    end
 
     -- 112, not 90: UIPanelButtonTemplate never resizes to its label, and "Logout Selected"
     -- overflows 90 px. Matches "Connect Offline"/"Logout Online" in the row above.
@@ -966,19 +1117,24 @@ NS.CleanBot_BuildManageTab = function()
         end)
     NS.CB_AnchorBelow(armyLogoutBtn, armyLoginBtn)
 
-    -- Snapshot summary under the buttons: counts, the partial marker, age, and what the
-    -- buttons do without a bridge. Full section width (Recruiter's status-label pattern)
-    -- so no sentence runs off the panel edge.
+    -- Snapshot summary under both columns: counts, the summon list's size, the partial marker, age,
+    -- and what the buttons do without a bridge. Full section width (Recruiter's status-label
+    -- pattern) so no sentence runs off the panel edge.
     local armyStatus = NS.CB_CreateLabel(armySection.bg, "")
     NS.CB_AnchorBelow(armyStatus, armyLogoutBtn)
     armyStatus:SetPoint("RIGHT", armySection.bg, "RIGHT", -(armySection.bg.paddingRight or 8), 0)
     armyStatus:SetJustifyH("LEFT")
 
     -- Repaint from the model. preserveScroll + SetSelectedValue keep the reader's place
-    -- when a lifecycle result or refresh rebuilds the rows.
+    -- when a lifecycle result or refresh rebuilds the rows. The basket repaints too: its rows read
+    -- presence from the live snapshot, so logging one out greys it where it stands.
     local function refreshArmyUI()
         armyList:SetItems(NS.CB_AltArmyRows(), true)
         if selectedArmyGuid then armyList:SetSelectedValue(selectedArmyGuid) end
+        summonList:SetItems(NS.CB_AltArmySelectionRows(), true)
+        if selectedSummonGuid and NS.CB_AltArmySelectionHas(selectedSummonGuid) then
+            summonList:SetSelectedValue(selectedSummonGuid)
+        end
         armyStatus:SetText(NS.CB_AltArmyStatusText())
     end
 
@@ -1022,6 +1178,8 @@ NS.CleanBot_BuildManageTab = function()
             presetsSection:UpdateBackground()
             altbotsSection:UpdateBackground()
             armySection:UpdateBackground()
+            -- Needs the section background's real width, which only exists after this pass.
+            sizeArmyColumns()
             updateContentHeight()
         end)
     end
@@ -1050,6 +1208,7 @@ NS.CleanBot_BuildManageTab = function()
         anchorToggle(presetsSection.toggleBtn,   partyRaidSection:GetAnchor())
         anchorToggle(altbotsSection.toggleBtn,   presetsSection:GetAnchor())
         anchorToggle(armySection.toggleBtn,      altbotsSection:GetAnchor())
+        sizeArmyColumns()   -- no-op while the section background still has its placeholder width
         scheduleUpdate()
     end
 

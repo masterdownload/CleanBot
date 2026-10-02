@@ -363,9 +363,14 @@ end
 NS.botReplyWindow = NS.botReplyWindow or {}   -- [lowername] = GetTime() deadline
 
 ---@param botName string  The bot we just whispered a command/query to.
-local function CB_MarkExpectReply(botName)
+---@param extraLines number|nil  Reply lines the command prints BEYOND the first — `ll ?` answers
+---   "Loot strategy: …" and then "Always loot items: …". Widening the window by one silence per
+---   expected extra line keeps a slow bot's tail line inside the bracket instead of leaking it to
+---   chat (a busy bot can answer more than WHISPER_SILENCE apart). Clamped to 4.
+local function CB_MarkExpectReply(botName, extraLines)
     if botName and botName ~= "" then
-        NS.botReplyWindow[strlower(botName)] = GetTime() + NS.WHISPER_SILENCE
+        local extra = math.min(math.max(tonumber(extraLines) or 0, 0), 4)
+        NS.botReplyWindow[strlower(botName)] = GetTime() + NS.WHISPER_SILENCE * (1 + extra)
     end
 end
 -- Exposed so broadcast (party/raid) commands can open reply windows for the bots
@@ -412,7 +417,8 @@ NS.CB_TagSelfGroup = CB_TagSelfGroup
 -- CB_SendBotCommand so they serialize.
 ---@param botName string  Target bot's name (whisper recipient / bridge BOT field).
 ---@param command string  The command text to run.
-local function CB_SendBotCommandRaw(botName, command)
+---@param extraReplyLines number|nil  Expected reply lines beyond the first (see CB_MarkExpectReply).
+local function CB_SendBotCommandRaw(botName, command, extraReplyLines)
     if NS.debugSimulate then
         NS.CB_Print("|cff888888[simulate]|r → " .. botName .. ": " .. command)
         return
@@ -424,7 +430,7 @@ local function CB_SendBotCommandRaw(botName, command)
             return
         end
     end
-    CB_MarkExpectReply(botName)
+    CB_MarkExpectReply(botName, extraReplyLines)
     CB_TagSelfWhisper(botName, command)
     SendChatMessage(command, "WHISPER", nil, botName)
 end
@@ -434,14 +440,17 @@ NS.CB_SendBotCommandRaw = CB_SendBotCommandRaw  -- for queued fetch/move sends (
 -- so their (possibly multi-line, link-bearing) replies never interleave with another reply
 -- stream and corrupt our parsing. Bridge commands (structured addon messages, no whisper
 -- reply) and simulated commands bypass the queue so they stay snappy.
-NS.CB_SendBotCommand = function(botName, command)
+---@param extraReplyLines number|nil  Expected reply lines beyond the first — widens the bot's
+---   reply window so a multi-line answer is hidden in full (see CB_MarkExpectReply).
+NS.CB_SendBotCommand = function(botName, command, extraReplyLines)
     -- Simulate prints, no reply; bridge is a fast addon message with no whisper stream.
     if NS.debugSimulate
         or (CB_EffectiveBridgeState() == "present" and CB_GetBridgeOpcode(command)) then
-        CB_SendBotCommandRaw(botName, command)
+        CB_SendBotCommandRaw(botName, command, extraReplyLines)
         return
     end
-    NS.CB_EnqueueRequest(strlower(botName), function() CB_SendBotCommandRaw(botName, command) end)
+    NS.CB_EnqueueRequest(strlower(botName),
+        function() CB_SendBotCommandRaw(botName, command, extraReplyLines) end)
 end
 
 --- Applies a fetched combat/non-combat strategy snapshot to a bot's entry,
@@ -498,6 +507,10 @@ NS.CB_RequestSync = function()
             CB_SendBridge("GET~ROSTER")
             CB_SendBridge("GET~DETAILS")
             CB_SendGetStates()
+            -- Formations and loot configuration in two silent sweeps instead of a "formation ?"
+            -- and an "ll ?" whisper per bot.
+            NS.CB_RequestFormations()
+            NS.CB_RequestLootStrategies()
         elseif CB_EffectiveBridgeState() == "absent" then
             CB_ProbePartyForBots()
         end
@@ -529,14 +542,372 @@ NS.CB_RequestStates = function()
     end)
 end
 
+-- ============================================================
+-- Movement formation over the bridge (GET~FORMATIONS)
+-- ============================================================
+-- "GET~FORMATIONS~GROUP~~<token>" is answered with one silent burst listing every group bot's
+-- current formation (see SendFormationPackets in
+-- modules/mod-multibot-bridge/src/MultiBotBridge.cpp):
+--   FORMATIONS_BEGIN~token~botCount
+--   FORMATIONS_ITEM~token~encodedName~encodedFormation     (one per bot)
+--   FORMATIONS_END~token~sentCount
+-- This replaces the per-bot "formation ?" whisper: that query cost one visible "Formation: …"
+-- whisper per bot per refresh, which is exactly the chatter the "hide bot chatter" setting was
+-- papering over (its reply window is a 0.5 s heuristic, so a late or extra reply line escaped).
+-- The endpoint predates the capability list and is therefore not advertised in CAPS, so it is not
+-- capability-gated here. An older bridge rejects it with ERR~GET~FORMATIONS~~UNKNOWN_GET — note the
+-- EMPTY token, which is why BridgeRpc also matches an ERR to an in-flight request by request type;
+-- without that the read would only fall back once its timeout expired.
+NS.formationsPending = false   -- true while a sweep is in flight (dedup)
+NS.formationsLastAt  = 0       -- GetTime() of the last sent sweep (rate floor)
+NS.FORMATIONS_MIN_INTERVAL = 2 -- seconds between sweeps, so per-bot fetches can't fan out
+
+--- Returns the roster entry for a bot, creating a minimal one when a bridge row arrives before
+--- ROSTER~/DETAIL~ did (mirrors CB_ApplyStateSnapshot). Shared by the formation and loot reads.
+---@param name string  Bot display name (already URL-decoded).
+---@return table|nil   Entry (nil for an unusable name)
+---@return string|nil  Its CleanBot_PartyBots key
+local function CB_EnsureBotEntry(name)
+    name = name and name:match("^%s*(.-)%s*$")
+    if not name or name == "" then return nil end
+
+    local key   = strlower(name)
+    local entry = CleanBot_PartyBots[key]
+    if entry then return entry, key end
+
+    local class = NS.CB_ResolveClass(name, "WARRIOR")
+    entry = {
+        name      = name,
+        class     = class,
+        combat    = NS.CB_DefaultCombat(),
+        nonCombat = NS.CB_DefaultNonCombat(),
+        classData = NS.CB_DefaultClassData(class),
+    }
+    CleanBot_PartyBots[key] = entry
+    return entry, key
+end
+
+--- Applies one FORMATIONS_ITEM row to a bot entry and repaints its tab. "?" means the server has
+--- no formation for that bot, so an existing cached value is kept.
+---@param name string       Bot display name (already URL-decoded).
+---@param formation string  Formation token as the bot saved it ("chaos", "arrow", …).
+local function CB_ApplyFormation(name, formation)
+    if not formation or formation == "" or formation == "?" then return end
+
+    local entry, key = CB_EnsureBotEntry(name)
+    if not entry then return end
+    if entry.formation == formation then return end
+
+    entry.formation = formation
+    if NS.CB_UpdateTabData then NS.CB_UpdateTabData(key, { formation = true }) end
+end
+
+--- Whisper fallback: ask every known bot that still has no cached formation. Runs only when the
+--- bridge is absent or the FORMATIONS read failed, so no-bridge users keep the feature.
+local function CB_FetchFormationsByWhisper()
+    for _, entry in pairs(CleanBot_PartyBots) do
+        if entry and entry.name and not entry.formation then
+            NS.CB_SendBotCommand(entry.name, "formation ?")
+        end
+    end
+end
+
+--- Reads every group bot's formation in one silent bridge round-trip, replacing the per-bot
+--- "formation ?" whispers. Debounced by an in-flight flag plus a minimum interval, and coalesced
+--- inside CB_Request, so the many per-bot fetches a tab refresh triggers cost a single packet.
+---@param force boolean|nil  Ignore the minimum-interval floor (used after a state reset).
+---@return boolean           True when the bridge took the read over (sent, in flight, or just
+---                           sent) — the caller must then NOT whisper "formation ?" itself.
+NS.CB_RequestFormations = function(force)
+    if CB_EffectiveBridgeState() ~= "present" or not NS.CB_Request then return false end
+    if NS.formationsPending then return true end
+    if not force and (GetTime() - NS.formationsLastAt) < NS.FORMATIONS_MIN_INTERVAL then
+        -- A sweep just went out; its reply already covers this bot. Let the caller whisper so a
+        -- bot that joined after that sweep still gets an answer instead of waiting for a sync.
+        return false
+    end
+
+    NS.formationsPending = true
+    NS.formationsLastAt  = GetTime()
+    NS.CB_Request({
+        type     = "FORMATIONS",
+        args     = { "GROUP", "", "<token>" },   -- scope GROUP, no target, token echoed
+        tags     = {
+            FORMATIONS_ITEM = function(fields)
+                CB_ApplyFormation(fields[3] and CB_UrlDecode(fields[3]) or "",
+                    fields[4] and CB_UrlDecode(fields[4]) or "")
+            end,
+        },
+        done     = "FORMATIONS_END",
+        coalesce = true,
+        timeout  = 6,
+        onDone   = function() NS.formationsPending = false end,
+        fallback = function() CB_FetchFormationsByWhisper() end,
+    })
+    return true
+end
+
+-- ============================================================
+-- Loot configuration over the bridge (GET~LOOTS)
+-- ============================================================
+-- "GET~LOOTS~GROUP~~<token>" answers in one silent burst what "ll ?" answers per bot in two visible
+-- whisper lines (capability LOOT_READ_V1, see SendLootStrategyPackets in
+-- modules/mod-multibot-bridge/src/MultiBotBridge.cpp):
+--   LOOTS_BEGIN~token~botCount
+--   LOOTS_ITEM~token~encodedName~encodedStrategy~alwaysLootCount   (one per bot)
+--   LOOTS_LOOTLIST~token~encodedName~id[,id…]                      (0..n per bot, packed to wire size)
+--   LOOTS_END~token~sentCount~truncated(0|1)
+-- Unlike FORMATIONS this endpoint IS capability-gated: a bridge without it never sees the request,
+-- and every caller keeps its "ll ?" whisper. The strategy arrives on the ITEM row, before any id
+-- list, so a truncated reply still yields every bot's strategy; partial id lists are simply
+-- dropped (nothing but a future UI reads them) and the next sweep retries.
+NS.lootPending = false     -- true while a sweep is in flight (dedup)
+NS.lootLastAt  = 0         -- GetTime() of the last sent sweep (rate floor)
+NS.LOOT_MIN_INTERVAL = 2   -- seconds between sweeps, mirroring FORMATIONS_MIN_INTERVAL
+
+-- Bots whose always-loot ids are still arriving: key -> { got, want, ids }.
+local lootRows = {}
+
+--- LOOTS_ITEM: the strategy is authoritative straight away; the count declares how many of the
+--- bot's always-loot item ids to expect in the LOOTLIST packets that follow it.
+local function CB_HandleLootItem(fields)
+    local name     = fields[3] and CB_UrlDecode(fields[3]) or ""
+    local strategy = fields[4] and CB_UrlDecode(fields[4]) or ""
+
+    local entry, key = CB_EnsureBotEntry(name)
+    if not entry then return end
+
+    if strategy ~= "" and strategy ~= "?" then
+        strategy = strlower(strategy)          -- same normalisation as the whispered reply parser
+        if entry.lootStrategy ~= strategy then
+            entry.lootStrategy = strategy
+            if NS.CB_UpdateTabData then NS.CB_UpdateTabData(key, { loot = true }) end
+        end
+    end
+
+    -- The count is how many ids THIS reply carries (the server truncates very long lists), so a zero
+    -- is an answer, not a missing one: the bot pins nothing. Publishing that as an empty table is
+    -- what lets the UI say "nothing extra" instead of "not read" — nil stays reserved for no answer.
+    local want = tonumber(fields[5]) or 0
+    lootRows[key] = want > 0 and { got = 0, want = want, ids = {} } or nil
+    if want == 0 then
+        local had = entry.alwaysLootItems
+        if not had or #had > 0 then
+            entry.alwaysLootItems = {}
+            if NS.CB_UpdateTabData then NS.CB_UpdateTabData(key, { loot = true }) end
+        end
+    end
+end
+
+--- LOOTS_LOOTLIST: appends the packed ids it carries to its bot's row and stores the list once the
+--- count announced by the ITEM row is complete. An unknown bot, a row already stored, or more ids
+--- than announced all end with the surplus ignored rather than a half-list being published.
+local function CB_HandleLootList(fields)
+    local name = fields[3] and CB_UrlDecode(fields[3]) or ""
+    local key  = strlower(name)
+    local row  = lootRows[key]
+    if not row then return end
+
+    for i = 4, #fields do
+        for idText in tostring(fields[i] or ""):gmatch("[^,]+") do
+            local id = tonumber(idText)
+            if id and row.got < row.want then
+                row.ids[#row.ids + 1] = id
+                row.got = row.got + 1
+            end
+        end
+    end
+
+    if row.got >= row.want then
+        -- Only publish a complete list, and only repaint when it actually changed — a sweep that
+        -- re-reads an unchanged bot must not churn the panels.
+        local entry = CleanBot_PartyBots[key]
+        if entry and table.concat(entry.alwaysLootItems or {}, ",") ~= table.concat(row.ids, ",") then
+            entry.alwaysLootItems = row.ids
+            if NS.CB_UpdateTabData then NS.CB_UpdateTabData(key, { loot = true }) end
+        end
+        lootRows[key] = nil
+    end
+end
+
+--- Whisper fallback: ask every known bot that still has no cached loot strategy. Runs when the
+--- bridge is absent or too old for LOOT_READ_V1, so those users keep today's behaviour. `1` extra
+--- reply line brackets both lines of the answer (see CB_MarkExpectReply).
+local function CB_FetchLootStrategiesByWhisper()
+    for _, entry in pairs(CleanBot_PartyBots) do
+        if entry and entry.name and not entry.lootStrategy then
+            NS.CB_SendBotCommand(entry.name, "ll ?", 1)
+        end
+    end
+end
+
+--- Reads every group bot's loot strategy (and always-loot list) in one silent bridge round-trip,
+--- replacing the per-bot "ll ?" whispers. Same debounce/coalesce shape as CB_RequestFormations.
+---@param force boolean|nil  Ignore the minimum-interval floor (used after a state reset).
+---@return boolean           True when the bridge owns this read — the caller must then NOT whisper
+---                           "ll ?" itself. False also means "no bridge / no LOOT_READ_V1 cap".
+NS.CB_RequestLootStrategies = function(force)
+    if CB_EffectiveBridgeState() ~= "present" or not NS.CB_Request then return false end
+    if not NS.CB_HasCap("LOOT_READ") then return false end
+    if NS.lootPending then return true end
+    if not force and (GetTime() - NS.lootLastAt) < NS.LOOT_MIN_INTERVAL then
+        -- A sweep just went out; let the caller whisper so a bot that joined after it is not left
+        -- waiting for the next sync (same reasoning as the formation sweep).
+        return false
+    end
+
+    NS.lootPending = true
+    NS.lootLastAt  = GetTime()
+    lootRows       = {}
+    NS.CB_Request({
+        type     = "LOOTS",
+        cap      = "LOOT_READ",
+        args     = { "GROUP", "", "<token>" },   -- scope GROUP, no target, token echoed
+        tags     = {
+            LOOTS_ITEM     = CB_HandleLootItem,
+            LOOTS_LOOTLIST = CB_HandleLootList,
+        },
+        done     = "LOOTS_END",
+        coalesce = true,
+        timeout  = 6,
+        onDone   = function() NS.lootPending = false end,
+        fallback = function() CB_FetchLootStrategiesByWhisper() end,
+    })
+    return true
+end
+
+-- ============================================================
+-- Always-loot read model (what the UI shows)
+--
+-- LOOT_READ_V1 put each bot's pinned-item list into entry.alwaysLootItems, but nothing displayed it.
+-- Three states have to stay distinct or the panel lies: nil = never answered (no bridge, or one too
+-- old), an empty table = answered and the bot pins nothing, a list = the bot pins those ids. Group
+-- slots bind several bots at once, so the summary also has to say when the members disagree.
+-- ============================================================
+
+-- Tooltip length caps: a group slot binds up to 24 bots and a bot can pin dozens of items.
+NS.LOOT_TIP_MAX_BOTS = 10
+NS.LOOT_TIP_MAX_ITEMS = 15
+
+--- Summarises the cached always-loot lists for a set of bots. Lists are compared as SETS: the server
+--- sends ids ascending (a std::set) but the addon keeps whatever order arrives, so a sorted copy is
+--- the signature rather than trusting the wire order. `ids` is therefore returned sorted.
+---@param keys string[]  Bot name-keys (CleanBot_PartyBots indices).
+---@return table  { total, read, state, ids } — state is "unknown" (nothing answered), "none" (all
+---  answers empty), "same" (all answers identical and non-empty), "mixed" (answers differ) or
+---  "partial" (some bots answered, others have not). `ids` is the shared list for "none"/"same".
+NS.CB_AlwaysLootSummary = function(keys)
+    local total, read, sig, state = 0, 0, nil, nil
+    for _, key in ipairs(keys or {}) do
+        total = total + 1
+        local entry = CleanBot_PartyBots[key]
+        local list  = entry and entry.alwaysLootItems
+        if type(list) == "table" then
+            read = read + 1
+            local sorted = {}
+            for _, id in ipairs(list) do sorted[#sorted + 1] = id end
+            table.sort(sorted)
+            local joined = table.concat(sorted, ",")
+            if not sig then sig = joined end
+            if sig ~= joined then state = "mixed" end
+        end
+    end
+
+    if not state then
+        if read == 0 then state = "unknown"
+        elseif read < total then state = "partial"
+        elseif sig == "" then state = "none"
+        else state = "same" end
+    end
+
+    local ids
+    if state == "none" or state == "same" then
+        ids = {}
+        for idText in (sig or ""):gmatch("[^,]+") do ids[#ids + 1] = tonumber(idText) end
+    end
+    return { total = total, read = read, state = state, ids = ids }
+end
+
+--- Names one item id from the client's own cache. These are items the bot has pinned, which the
+--- player's client may never have seen, so an unknown id falls back to its number rather than
+--- disappearing from the list.
+---@param id number  Item entry id.
+---@return string    Item name, or "#<id>" when the client has no tooltip for it.
+local function CB_ItemName(id)
+    local name = (type(GetItemInfo) == "function" and GetItemInfo(id)) or nil
+    return name or ("#" .. tostring(id))
+end
+
+--- Tooltip lines listing how much each bound bot pins. A group slot can bind two dozen bots, so the
+--- list is capped and the remainder counted rather than running off the screen.
+---@param keys string[]  Bot name-keys to describe.
+---@return string[]       Two lines per bot: its name, then its count or "not read yet".
+local function CB_BotLootLines(keys)
+    keys = keys or {}
+    local lines, shown = {}, 0
+    for _, key in ipairs(keys) do
+        if shown >= NS.LOOT_TIP_MAX_BOTS then break end
+        shown = shown + 1
+        local entry = CleanBot_PartyBots[key]
+        local list  = entry and entry.alwaysLootItems
+        lines[#lines + 1] = (entry and entry.name) or key
+        lines[#lines + 1] = type(list) == "table"
+            and string.format("  %d item(s)", #list) or "  not read yet"
+    end
+    if #keys > shown then lines[#lines + 1] = string.format("  ... and %d more", #keys - shown) end
+    return lines
+end
+
+--- Turns a summary into what the panel prints and what its tooltip explains. Kept apart from the
+--- rendering so the wording — including the "not read yet" case that must not read as "nothing" —
+--- is testable without a UI.
+---@param keys string[]  Bot name-keys the row describes.
+---@return string  Collapsed row text (never empty).
+---@return string  Tooltip body: the item names, or why there are none to show.
+NS.CB_AlwaysLootView = function(keys)
+    local sum   = NS.CB_AlwaysLootSummary(keys)
+    local text  = nil
+    local lines = {}
+
+    if sum.state == "unknown" then
+        text = "Not read"
+        lines[#lines + 1] =
+            "The server has not reported these bots' pinned-item lists."
+        lines[#lines + 1] =
+            "Needs a MultiBot Bridge that reports loot settings; until then this stays unknown rather than empty."
+    elseif sum.state == "partial" then
+        text = string.format("%d of %d read", sum.read, sum.total)
+        for _, line in ipairs(CB_BotLootLines(keys)) do lines[#lines + 1] = line end
+    elseif sum.state == "mixed" then
+        text = string.format("Varies (%d of %d read)", sum.read, sum.total)
+        for _, line in ipairs(CB_BotLootLines(keys)) do lines[#lines + 1] = line end
+    elseif sum.state == "none" then
+        text = "Nothing extra"
+        lines[#lines + 1] = "No items are pinned: these bots loot only what their loot quality allows."
+    else
+        local ids, n = sum.ids or {}, #(sum.ids or {})
+        text = n == 1 and "1 item" or string.format("%d items", n)
+        for i = 1, math.min(n, NS.LOOT_TIP_MAX_ITEMS) do lines[#lines + 1] = CB_ItemName(ids[i]) end
+        if n > NS.LOOT_TIP_MAX_ITEMS then
+            lines[#lines + 1] = string.format("... and %d more", n - NS.LOOT_TIP_MAX_ITEMS)
+        end
+    end
+
+    -- The write half is still the bot's own command, so say where to change it (see "Left from the
+    -- chatter list": there is no bridge verb for this yet).
+    lines[#lines + 1] = " "; lines[#lines + 1] = "Pinned by name or link with the bot's ll command."
+    return text, table.concat(lines, "\n")
+end
+
 -- Authoritative per-bot re-read of strategies + formation + loot — used to VERIFY/reconcile after a
 -- command that optimistically rewrites a bot's whole state (e.g. the Individual tab's "reset botAI",
 -- applied optimistically by Overhear). Unlike CB_RequestSync this targets one ALREADY-KNOWN bot —
 -- CB_RequestSync's no-bridge probe (CB_ProbePartyForBots) skips known bots, so it can't re-read here.
 -- "co ?" needs awaitingCo set so its reply is parsed and chains "nc ?" (mirrors CB_SetSelfBotActive);
--- the formation/loot replies match by prefix and need no flag. All three are whispered queries (never
--- bridged) and queue in order BEHIND the triggering command, so they read the post-command state; each
--- reply repaints via CB_UpdateTabData, overwriting the optimistic guess with the bot's real values.
+-- it queues BEHIND the triggering command, so it reads post-command state. Formation and loot use
+-- the silent bridge reads where those exist, which cannot ride that queue — they are scheduled after
+-- it instead, buying the same ordering. Each reply repaints via CB_UpdateTabData, overwriting the
+-- optimistic guess with the bot's real values.
 ---@param key     string  Bot name-key (CleanBot_PartyBots index).
 ---@param botName string  The bot's name (whisper recipient).
 NS.CB_RereadBotState = function(key, botName)
@@ -544,8 +915,20 @@ NS.CB_RereadBotState = function(key, botName)
     if not (entry and botName) then return end
     entry.awaitingCo = true
     NS.CB_SendBotCommand(botName, "co ?")
-    NS.CB_SendBotCommand(botName, "formation ?")
-    NS.CB_SendBotCommand(botName, "ll ?")
+    -- Formation and loot: the silent bulk reads replace both whispers. Delay them past the queued
+    -- reset so they read post-command state — the ordering guarantee the whispered queries had for
+    -- free. Without a bridge (or, for loot, without LOOT_READ_V1) each falls back to its whisper.
+    if CB_EffectiveBridgeState() == "present" then
+        NS.CB_After(1.5, function()
+            NS.CB_RequestFormations(true)
+            if not NS.CB_RequestLootStrategies(true) then
+                NS.CB_SendBotCommand(botName, "ll ?", 1)   -- two answer lines: bracket both
+            end
+        end)
+    else
+        NS.CB_SendBotCommand(botName, "formation ?")
+        NS.CB_SendBotCommand(botName, "ll ?", 1)
+    end
 end
 
 -- ============================================================
@@ -1065,28 +1448,34 @@ NS.CB_FetchStats = function(entry, force)
     end)
 end
 
--- Queries a bot's current movement formation ("formation ?"). The reply
--- ("Formation: <name>") is parsed in the CHAT_MSG_WHISPER handler into entry.formation.
--- Cached: skips when entry.formation is already known unless `force` is set. Routes
--- through CB_SendBotCommand so it serializes and the reply is hidden.
+-- Queries a bot's current movement formation. With the bridge present this is a no-op whisper:
+-- one silent GET~FORMATIONS sweep covers every bot at once (see NS.CB_RequestFormations), and its
+-- FORMATIONS_ITEM rows land in CB_ApplyFormation. Without a bridge it whispers "formation ?" and
+-- the reply is parsed in the CHAT_MSG_WHISPER handler into entry.formation.
+-- Cached: skips when entry.formation is already known unless `force` is set.
 ---@param entry table   The CleanBot_PartyBots entry to query.
 ---@param force boolean? Re-query even when a formation is already cached.
 NS.CB_FetchFormation = function(entry, force)
     if not entry or not entry.name then return end
     if entry.formation and not force then return end
+    if NS.CB_RequestFormations(force) then return end
     NS.CB_SendBotCommand(entry.name, "formation ?")
 end
 
--- Queries a bot's current loot-quality strategy ("ll ?"). The reply
--- ("Loot strategy: <mode>") is parsed in the CHAT_MSG_WHISPER handler into entry.lootStrategy.
--- Cached: skips when entry.lootStrategy is already known unless `force` is set. Routes through
--- CB_SendBotCommand so it serializes and the reply is hidden (same as CB_FetchFormation).
+-- Queries a bot's current loot-quality strategy. With a bridge that advertises LOOT_READ_V1 this is
+-- a no-op whisper: one silent GET~LOOTS sweep covers every bot (see NS.CB_RequestLootStrategies).
+-- Otherwise it whispers "ll ?" and the reply ("Loot strategy: <mode>") is parsed in the
+-- CHAT_MSG_WHISPER handler into entry.lootStrategy; `1` extra reply line widens the reply window to
+-- cover both lines of that answer ("Loot strategy: …" then "Always loot items: …"), and
+-- ChatFilter.lua hides the tail line by signature if it still slips out.
+-- Cached: skips when entry.lootStrategy is already known unless `force` is set.
 ---@param entry table   The CleanBot_PartyBots entry to query.
 ---@param force boolean? Re-query even when a loot strategy is already cached.
 NS.CB_FetchLootStrategy = function(entry, force)
     if not entry or not entry.name then return end
     if entry.lootStrategy and not force then return end
-    NS.CB_SendBotCommand(entry.name, "ll ?")
+    if NS.CB_RequestLootStrategies(force) then return end
+    NS.CB_SendBotCommand(entry.name, "ll ?", 1)
 end
 
 -- Fetches a bot's bank contents. Whisper-only — bank has no bridge packet, and the
