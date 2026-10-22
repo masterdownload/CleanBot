@@ -220,6 +220,12 @@ CleanBot_PartyBots = {}  -- global so other modules and XML scripts can reach it
 -- ============================================================
 NS.EXPANDED_WIDTH    = 850
 NS.FRAME_HEIGHT      = 600
+-- Extra width for the Manage tab, on top of COLLAPSED_WIDTH. Its Alt Army section is two lists with a
+-- transfer column between them, and COLLAPSED_WIDTH (one model column wide) leaves each list less room
+-- than its scrollbar band plus a character name needs. An addition rather than a fixed number so a
+-- padding change in Settings — which shifts COLLAPSED_WIDTH — keeps both tabs in step; set it to 0 to
+-- go back to the old width.
+NS.MANAGE_EXTRA_WIDTH = 120
 NS.TAB_WIDTH         = 88
 NS.TAB_HEIGHT        = 24
 NS.TITLE_H           = 28
@@ -344,13 +350,16 @@ end
 
 -- Target width for the CURRENT top tab: Individual restores the saved expand state; Group is always
 -- expanded while bots are present (no collapse affordance) and follows the saved state only in the
--- empty-roster case; other tabs use collapsed width. Returns nil before COLLAPSED_WIDTH is computed.
+-- empty-roster case; Manage is collapsed width plus MANAGE_EXTRA_WIDTH (two side-by-side lists);
+-- other tabs use collapsed width. Returns nil before COLLAPSED_WIDTH is computed.
 ---@return number?  Target frame width, or nil if geometry isn't ready yet.
 NS.CB_CurrentTargetWidth = function()
     if not NS.COLLAPSED_WIDTH then return nil end
     local savedW = NS.individualExpanded and NS.EXPANDED_WIDTH or NS.COLLAPSED_WIDTH
     local index  = NS.activeTopTabIndex
-    if index == 2 then
+    if index == 1 then
+        return NS.COLLAPSED_WIDTH + (NS.MANAGE_EXTRA_WIDTH or 0)
+    elseif index == 2 then
         return savedW
     elseif index == 3 then
         local haveBots = NS.desiredBots and #NS.desiredBots > 0
