@@ -140,14 +140,21 @@ end
 
 -- Drops all capability state. Called on every handshake and whenever the bridge
 -- stops being present, so no feature can act on a previous session's caps.
----@param reason string|nil  Why the reset happened (recorded in NS.lastCapsReset).
-NS.CB_ResetBridgeCaps = function(reason)
+---@param reason string|nil        Why the reset happened (recorded in NS.lastCapsReset).
+---@param keepHandshake boolean|nil  Keep bridgeProtocol/bridgeName. CAPS_BEGIN always follows
+--                                   HELLO_ACK on the wire, so a reset that begins a burst belongs
+--                                   to the handshake that recorded those fields, not to an old
+--                                   session: clearing them here made /cbdebug caps print
+--                                   "proto=- name=-" after every successful handshake.
+NS.CB_ResetBridgeCaps = function(reason, keepHandshake)
     NS.bridgeCaps         = {}
     for alias in pairs(capAliases) do capAliases[alias] = nil end
     NS.bridgeCapsComplete = false
     NS.bridgeCapsMissing  = false
-    NS.bridgeProtocol     = nil
-    NS.bridgeName         = nil
+    if not keepHandshake then
+        NS.bridgeProtocol = nil
+        NS.bridgeName     = nil
+    end
     capsChunk             = nil
     capsTimer             = capsTimer + 1
     NS.lastCapsReset      = reason or "reset"
@@ -635,7 +642,8 @@ NS.CB_RpcInbound = function(msg)
     -- Capability burst (part of the handshake; never a feature response).
     if tag == "CAPS_BEGIN" then
         capsChunk = {}
-        NS.CB_ResetBridgeCaps("caps")
+        -- keepHandshake: this burst is the one HELLO_ACK announced, so protocol/name stay.
+        NS.CB_ResetBridgeCaps("caps", true)
         return true
     elseif tag == "CAPS" then
         capsChunk = capsChunk or {}
