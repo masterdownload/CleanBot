@@ -777,6 +777,119 @@ NS.CB_RequestLootStrategies = function(force)
 end
 
 -- ============================================================
+-- Loot strategy WRITE over the bridge (RUN~LOOT_STRATEGY)
+-- ============================================================
+-- Replaces one "ll <strategy>" whisper per bot — and the "Loot strategy set to ..." ack each one
+-- prints, which ChatFilter has to swallow. One scoped request changes the whole group and answers
+-- LOOT_STRATEGY_RESULT~scope~target~token~strategy~canonical~OK|ERR~reason~matched~changed.
+-- Server side: RunLootStrategyCommand in modules/mod-multibot-bridge/src/MultiBotBridge.cpp.
+-- Capability-gated on LOOT_STRATEGY_V1, so an older bridge never sees the request and every caller
+-- keeps its whispers — which is why this returns a synchronous yes/no instead of degrading inside a
+-- callback: the caller must know NOW whether to whisper, and a fallback here could only ever double
+-- the whisper path rather than replace it.
+-- Canonical names only, mirroring the server's closed vocabulary: the dropdown offers exactly these
+-- four, and sending anything else buys a round trip and a BAD_STRATEGY.
+local LOOT_STRATEGY_NAMES = { normal = true, gray = true, disenchant = true, all = true }
+
+--- Applies one LOOT_STRATEGY_RESULT to the cache so the panel shows what the server confirmed.
+--- The reply is the authority: canonicalStrategy is what the bot is now on, so an alias or a
+--- default can never be hidden by an optimistic local write. Declared before the requester because
+--- Lua resolves a `local function` at its declaration point, not at call time.
+---@param fields string[]  Wire fields of the result frame ([1] is the tag).
+---@param names string[]|nil  The bots this request was for; nil means the whole group.
+local function CB_ReconcileLootStrategy(fields, names)
+    local verdict   = fields[7] or "ERR"
+    local canonical = fields[6] and CB_UrlDecode(fields[6]) or ""
+    if verdict ~= "OK" or canonical == "" then return end   -- the cache already says the truth
+
+    local changed = {}
+    local function mark(name)
+        local entry, key = CB_EnsureBotEntry(name)
+        if entry then
+            entry.lootStrategy = canonical
+            changed[key or name] = entry
+        end
+    end
+
+    if names and #names > 0 then
+        for _, name in ipairs(names) do mark(name) end
+    else
+        for _, entry in pairs(CleanBot_PartyBots) do
+            if entry and entry.name then mark(entry.name) end
+        end
+    end
+
+    if NS.CB_UpdateTabData and next(changed) then
+        for key in pairs(changed) do NS.CB_UpdateTabData(key, { loot = true }) end
+    end
+end
+NS.CB_ReconcileLootStrategy = CB_ReconcileLootStrategy
+
+--- Sends one strategy request for a single scope. Kept separate so a basket of bots can loop it.
+--- CB_Request answers (handle, verdict) - the verdict is the SECOND return, so binding the first to
+--- a local and comparing it to "sent" can only ever be false, which would leave this feature
+--- silently whispering forever.
+---@param names string[]|nil  One name for BOT scope, nil/empty for the whole group.
+---@param strategy string     Canonical name.
+---@return string|nil         CB_Request verdict, or nil when it refused to touch the wire.
+local function CB_LootStrategySent(verdict)
+    return verdict == "sent" or verdict == "queued" or verdict == "coalesced"
+end
+
+local function CB_SendLootStrategyRequest(names, strategy)
+    -- Group scope only when it really means the group; a named bot gets BOT scope.
+    local scope, target = "GROUP", ""
+    if names and #names > 0 then
+        scope, target = "BOT", names[1]
+    end
+
+    local _, verdict = NS.CB_Request({
+        type         = "LOOT_STRATEGY",
+        verb         = "RUN",
+        cap          = "LOOT_STRATEGY",
+        args         = { scope, target or "", "<token>", strategy },
+        done         = "LOOT_STRATEGY_RESULT",
+        tags         = {
+            LOOT_STRATEGY_RESULT = function(fields)
+                CB_ReconcileLootStrategy(fields, names)
+            end,
+        },
+        maxPerWindow = 8,      -- mirrors kLootStrategyRateLimit / kLootStrategyRateWindow
+        window       = 2,
+        timeout      = 6,
+    })
+    return verdict
+end
+
+--- Requests a loot strategy change over the bridge when the bridge can serve it.
+---@param names string[]|nil  Bot names to change; nil or empty means every bot in the group.
+---@param strategy string     Canonical name: normal | gray | disenchant | all.
+---@return boolean            True when the bridge owns the write — the caller must NOT whisper.
+--                            False means no bridge, no cap, a bad name or a refused verdict: the
+--                            caller whispers exactly as it did before this endpoint existed.
+NS.CB_TrySetLootStrategy = function(names, strategy)
+    if not NS.CB_Request or CB_EffectiveBridgeState() ~= "present" then return false end
+    if not NS.CB_HasCap("LOOT_STRATEGY") then return false end
+    if type(strategy) ~= "string" or not LOOT_STRATEGY_NAMES[strategy] then return false end
+
+    if names and #names > 1 then
+        -- A basket of specific bots goes out one BOT-scoped request each: GROUP scope would also
+        -- change bots the player did not select. The rate mirror queues them against the server's
+        -- 8-per-2 s window instead of overflowing it.
+        local sent = false
+        for _, name in ipairs(names) do
+            if CB_LootStrategySent(CB_SendLootStrategyRequest({ name }, strategy)) then sent = true end
+        end
+        return sent
+    end
+
+    local verdict = CB_SendLootStrategyRequest(names, strategy)
+    -- A nil verdict means CB_Request refused to touch the wire (no bridge / no cap / rate verdict);
+    -- the caller whispers and behaviour is today's behaviour.
+    return CB_LootStrategySent(verdict)
+end
+
+-- ============================================================
 -- Always-loot read model (what the UI shows)
 --
 -- LOOT_READ_V1 put each bot's pinned-item list into entry.alwaysLootItems, but nothing displayed it.

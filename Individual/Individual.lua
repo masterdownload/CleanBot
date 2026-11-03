@@ -1196,8 +1196,21 @@ local function CB_BuildColumnGroups(col, groups, cmd, slot, tag, startGi, regist
                     info.tooltipOnButton = 1
                     info.func            = function()
                         UIDropDownMenu_SetText(self, o.name)        -- immediate feedback
-                        for _, m in ipairs(CB_SlotTargets(slot)) do
-                            NS.CB_SendBotCommand(m.name, group.cmd .. " " .. o.value)
+                        local targets = CB_SlotTargets(slot)
+                        -- Loot quality has a structured endpoint: one bridge request per scope
+                        -- instead of one whisper per bot, and no "Loot strategy set to ..." ack for
+                        -- ChatFilter to swallow. Every other setting dropdown, and this one on a
+                        -- bridge that is absent or too old, keeps the whisper loop below untouched.
+                        local bridged = false
+                        if group.cmd == "ll" and NS.CB_TrySetLootStrategy then
+                            local names = {}
+                            for _, m in ipairs(targets) do names[#names + 1] = m.name end
+                            bridged = NS.CB_TrySetLootStrategy(names, o.value)
+                        end
+                        for _, m in ipairs(targets) do
+                            if not bridged then
+                                NS.CB_SendBotCommand(m.name, group.cmd .. " " .. o.value)
+                            end
                             local e = CleanBot_PartyBots[m.key]
                             if e then e[field] = o.value end         -- optimistic cache
                         end
