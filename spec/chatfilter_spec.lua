@@ -16,11 +16,17 @@ local loadedFilters = Mock.chatFilters.CHAT_MSG_SYSTEM ~= nil
 if not loadedFilters then dofile("ChatFilter.lua") end
 local NS = CleanBotNS
 
--- The single filter registered for `event` (each event has exactly one CleanBot filter).
+-- Runs every CleanBot filter registered for `event` the way the client chains them: the first
+-- one returning true hides the line; a filter returning false plus new args rewrites them.
 local function filter(event, msg, author)
     local list = Mock.chatFilters[event]
-    assert(list and #list == 1, "expected exactly one filter for " .. event)
-    return list[1](nil, event, msg, author)
+    assert(list and #list >= 1, "expected a filter for " .. event)
+    for _, fn in ipairs(list) do
+        local hide, newMsg, newAuthor = fn(nil, event, msg, author)
+        if hide then return true end
+        if newMsg ~= nil then msg, author = newMsg, newAuthor or author end
+    end
+    return false
 end
 
 describe("ChatFilter outgoing whisper (INFORM)", function()
