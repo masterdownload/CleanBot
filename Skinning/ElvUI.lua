@@ -62,18 +62,28 @@ NS.OUTER_BACKDROP = {
 -- ============================================================
 
 -- Registry of all top-level CleanBot windows (UIParent children).
--- Each frame registered here receives SetScale on theme apply.
+-- Each named frame registered here receives SetScale on theme apply and is
+-- added to UISpecialFrames so WoW closes it through the native Escape flow.
 -- Call NS.CB_RegisterRootFrame(f) immediately after creating any
 -- top-level CleanBot window.
 NS.CB_rootFrames = {}
 -- Registers a top-level CleanBot window and immediately applies the current
 -- scale so lazily-created frames (inventory, sample layout) get the right
 -- value even when they open after the scale was last changed.
---- Registers a top-level window for scale refresh and applies the current scale.
+--- Registers a named top-level window for scale refresh and native Escape handling.
 ---@param frame table  The top-level frame (UIParent child) to register.
 NS.CB_RegisterRootFrame = function(frame)
+    if not frame or not frame.GetName then return end
+    local name = frame:GetName()
+    if not name or name == "" then return end
+
     NS.CB_rootFrames[frame] = true
     frame:SetScale((NS.scale or 100) / 100)
+
+    for _, registeredName in ipairs(UISpecialFrames) do
+        if registeredName == name then return end
+    end
+    table.insert(UISpecialFrames, name)
 end
 
 -- Registry of frames skinned by CB_ApplyFrameSkin.
