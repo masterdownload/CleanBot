@@ -410,6 +410,14 @@ local function CB_TagSelfGroup(text)
 end
 NS.CB_TagSelfGroup = CB_TagSelfGroup
 
+-- Newer mod-multibot-bridge builds reject RUN~ requests with an empty request token
+-- (BAD_TOKEN). Send a short unique token per request: [A-Za-z0-9-_.:] only.
+local cbRunToken = 0
+local function CB_NextRunToken()
+    cbRunToken = (cbRunToken + 1) % 1000000
+    return "cb" .. cbRunToken
+end
+
 -- Raw dispatch: the actual bridge-or-whisper send. Routes through the bridge (silent) when
 -- present and the command is allowlisted; otherwise whispers. Honors the debugSimulate and
 -- debugBridgeOverride toggles. Called by the serial queue (for whispers) and directly for
@@ -426,7 +434,7 @@ local function CB_SendBotCommandRaw(botName, command, extraReplyLines)
     if CB_EffectiveBridgeState() == "present" then
         local opcode = CB_GetBridgeOpcode(command)
         if opcode then
-            CB_SendBridge("RUN~" .. opcode .. "~BOT~" .. botName .. "~~" .. command)
+            CB_SendBridge("RUN~" .. opcode .. "~BOT~" .. botName .. "~" .. CB_NextRunToken() .. "~" .. command)
             return
         end
     end

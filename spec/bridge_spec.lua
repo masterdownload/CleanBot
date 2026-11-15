@@ -37,7 +37,8 @@ describe("Bridge command routing", function()
         NS.CB_SendBotCommand("Bot", "co +focus")
         assert.equals(1, #Mock.addon)
         assert.equals(0, #Mock.whispers)
-        assert.equals("RUN~COMBAT~BOT~Bot~~co +focus", Mock.addon[1].text)
+        -- Non-empty request token: newer bridges reject an empty one with BAD_TOKEN.
+        assert.is_true(Mock.addon[1].text:match("^RUN~COMBAT~BOT~Bot~cb%d+~co %+focus$") ~= nil)
         assert.equals("PARTY", Mock.addon[1].channel)
     end)
 
@@ -426,5 +427,65 @@ describe("Loot strategy reply parsing", function()
         Mock.fireEvent("CHAT_MSG_WHISPER", "just chatting", "Bot")
 
         assert.is_nil(e.lootStrategy)
+    end)
+end)
+
+-- GET~LOOTS has no handler in mod-multibot-bridge (1da0598 / 9f0e8ba7): the loot read must fall
+-- back to the "ll ?" whisper instead of hanging, whether the cap is missing, the server answers
+-- ERR, or nothing answers at all.
+describe("Loot read fallback (GET~LOOTS)", function()
+    if not CleanBotNS.CB_Request then dofile("BridgeRpc.lua") end
+
+    local function sentLoots()
+        for _, a in ipairs(Mock.addon) do
+            if a.text:match("^GET~LOOTS~") then return a.text end
+        end
+    end
+    local function advertise(caps)
+        Mock.fireEvent("CHAT_MSG_ADDON", "MBOT", "CAPS_BEGIN")
+        Mock.fireEvent("CHAT_MSG_ADDON", "MBOT", "CAPS~" .. caps)
+        Mock.fireEvent("CHAT_MSG_ADDON", "MBOT", "CAPS_END")
+    end
+
+    before_each(function()
+        Mock.reset()
+        NS.CB_ResetRpcState("test")
+        CleanBot_PartyBots     = { bot = { name = "Bot" } }
+        NS.bridgeState         = "present"
+        NS.debugBridgeOverride = nil
+        NS.lootPending         = false
+        NS.lootLastAt          = -100
+        Mock.party             = 1
+    end)
+
+    it("whispers 'll ?' and sends no GET~LOOTS when the bridge lacks LOOT_READ", function()
+        advertise("ALT_ROSTER_V1,INVENTORY_EXACT_V1")
+        NS.CB_FetchLootStrategy(CleanBot_PartyBots.bot, true)
+        assert.is_nil(sentLoots())
+        assert.equals(1, #Mock.whispers)
+        assert.equals("ll ?", Mock.whispers[1].text)
+    end)
+
+    it("falls back to the whisper when the bridge rejects GET~LOOTS with an empty-token ERR", function()
+        advertise("LOOT_READ_V1")
+        NS.CB_FetchLootStrategy(CleanBot_PartyBots.bot, true)
+        assert.is_true(sentLoots() ~= nil)
+        assert.equals(0, #Mock.whispers)
+
+        Mock.fireEvent("CHAT_MSG_ADDON", "MBOT", "ERR~GET~LOOTS~~UNKNOWN_GET")
+        assert.equals(1, #Mock.whispers)
+        assert.equals("ll ?", Mock.whispers[1].text)
+        assert.is_false(NS.lootPending)
+    end)
+
+    it("falls back to the whisper when GET~LOOTS gets no answer", function()
+        advertise("LOOT_READ_V1")
+        NS.CB_FetchLootStrategy(CleanBot_PartyBots.bot, true)
+        assert.equals(0, #Mock.whispers)
+
+        Mock.tick(7)
+        assert.equals(1, #Mock.whispers)
+        assert.equals("ll ?", Mock.whispers[1].text)
+        assert.is_false(NS.lootPending)
     end)
 end)

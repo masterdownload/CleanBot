@@ -146,6 +146,8 @@ _G.strlower = string.lower
 _G.strupper = string.upper
 _G.strrep   = string.rep
 _G.strtrim  = function(s) return (s:gsub("^%s*(.-)%s*$", "%1")) end
+_G.gsub     = string.gsub
+_G.strchar  = string.char
 
 -- Test-environment overrides installed AFTER run.lua dofiles the real CleanBot.lua
 -- (which provides CB_SplitOnce, the group helpers, etc. — tested directly in core_spec).
