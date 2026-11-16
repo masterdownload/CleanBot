@@ -4,8 +4,8 @@ A clean interface to manage Playerbots on WotLK 3.3.5a Servers. No more complex 
 
 ⚠️Requires the latest version of [Playerbots](https://github.com/mod-playerbots/mod-playerbots) installed on your server⚠️
 
-- Fully Skinned for [ElvUI](https://github.com/ElvUI-WotLK/ElvUI/tree/master) or the default UI
-    - Automatically Switches
+- Fully Skinned for the default WoW UI or [ElvUI](https://github.com/ElvUI-WotLK/ElvUI/tree/master)
+    - Choose the **Blizzard** (default) or **Flat (ElvUI)** theme in Settings
 - Compatible Optional Extras:
     - [Multibot Bridge Server Module](https://github.com/Wishmaster117/mod-multibot-bridge) - Removes some of the whisper spam and speeds up query/action time
     - [Talented](https://warperia.com/addon-wotlk/talented/) - Opens the large three panel talent tree for bots
@@ -60,7 +60,7 @@ A clean interface to manage Playerbots on WotLK 3.3.5a Servers. No more complex 
 <img width="300" alt="image" src="https://github.com/user-attachments/assets/30a522cf-69bc-4505-8c6c-29e0e81ea82f" />
 
 # Settings Tab
-- Change Transparency, Scale, Accent Color, and Layout Values
+- Change Theme, Transparency, Scale, Accent Color, and Layout Values
 - Enable or Disable a /wave from the bot when selecting them in the UI
 
 <img width="300" alt="image" src="https://github.com/user-attachments/assets/8036f2c4-d192-45d8-828b-e56a3f771a8c" />

@@ -311,6 +311,10 @@ NS.CleanBot_BuildSettingsTab = function()
     local syncApplyBtn
 
     -- ── Pending values ─────────────────────────────────────────
+    -- Theme only takes effect after a UI reload, so NS.theme (the live theme) never changes here;
+    -- appliedTheme tracks the last Applied (saved) choice for Cancel and the dirty check.
+    local appliedTheme        = NS.theme
+    local pendingTheme        = NS.theme
     local pendingScale        = NS.scale
     local pendingTransparency = NS.transparency
     local pendingAccentR      = NS.accentColor.r
@@ -331,12 +335,15 @@ NS.CleanBot_BuildSettingsTab = function()
     -- ── Action buttons ─────────────────────────────────────────
     -- Created first so BTN_ROW_H can query the actual rendered height.
     local defaultsBtn = NS.CB_CreateButton(panel, "CleanBotDefaultsSettings", "Defaults", 80, 22, function()
+        -- Defaults restores the default theme too, with that theme's own accent/transparency.
+        local defAccent, defTransparency = NS.CB_ThemeDefaultValues(NS.DEFAULT_THEME)
+        pendingTheme        = NS.DEFAULT_THEME
         pendingScale        = NS.THEME_DEFAULTS.scale
-        pendingTransparency = NS.THEME_DEFAULTS.transparency
-        pendingAccentR      = NS.THEME_DEFAULTS.accentColor.r
-        pendingAccentG      = NS.THEME_DEFAULTS.accentColor.g
-        pendingAccentB      = NS.THEME_DEFAULTS.accentColor.b
-        pendingAccentA      = NS.THEME_DEFAULTS.accentColor.a
+        pendingTransparency = defTransparency
+        pendingAccentR      = defAccent.r
+        pendingAccentG      = defAccent.g
+        pendingAccentB      = defAccent.b
+        pendingAccentA      = defAccent.a
         for k, defaults in pairs(NS.MARGIN_DEFAULTS) do
             pendingMargins[k].top    = defaults.top
             pendingMargins[k].bottom = defaults.bottom
@@ -354,6 +361,7 @@ NS.CleanBot_BuildSettingsTab = function()
     NS.CB_AnchorWall(defaultsBtn, panel, "BOTTOMLEFT")
 
     local cancelBtn = NS.CB_CreateButton(panel, "CleanBotCancelSettings", "Cancel", 80, 22, function()
+        pendingTheme        = appliedTheme
         pendingScale        = NS.scale
         pendingTransparency = NS.transparency
         pendingAccentR      = NS.accentColor.r
@@ -394,10 +402,20 @@ NS.CleanBot_BuildSettingsTab = function()
     end)
     NS.CB_AnchorWall(cancelBtn, panel, "BOTTOMRIGHT")
 
+    -- Offered after Apply when the saved theme differs from the live one. "No" keeps the current
+    -- look for this session; the saved theme still takes effect at the next reload/login.
+    NS.CB_RegisterConfirmPopup("CLEANBOT_THEME_RELOAD",
+        "The CleanBot theme changes after a UI reload. Reload the UI now?",
+        function() ReloadUI() end,
+        function() NS.CB_Print("The new theme will take effect after your next /reload.") end)
+
     local applyBtn
     applyBtn = NS.CB_CreateButton(panel, "CleanBotApplySettings", "Apply", 80, 22, function()
         -- Set NS values + persist, then emit once (CB_EmitDisplaySettings) so the theme/layout
         -- subscribers re-apply. No refresher is called directly here.
+        local themeChanged = pendingTheme ~= appliedTheme
+        appliedTheme = pendingTheme
+        CleanBot_SavedVars.theme = pendingTheme
         NS.scale       = pendingScale
         NS.transparency = pendingTransparency
         NS.accentColor.r = pendingAccentR
@@ -436,6 +454,9 @@ NS.CleanBot_BuildSettingsTab = function()
         NS.CB_EmitDisplaySettings(true)
         applyBtn:Disable()
         NS.CB_Print("Settings applied.")
+        if themeChanged and appliedTheme ~= NS.theme then
+            StaticPopup_Show("CLEANBOT_THEME_RELOAD")
+        end
     end)
     applyBtn:SetPoint("RIGHT", cancelBtn, "LEFT",
         -((applyBtn.marginRight or 0) + (cancelBtn.marginLeft or 0)), 0)
@@ -540,11 +561,40 @@ NS.CleanBot_BuildSettingsTab = function()
     local themeSF, themeChild = NS.CB_CreateScrollFrame(themePanel, "CleanBotThemeScroll")
     themeChild:SetHeight(300)
 
+    -- ── Theme ──────────────────────────────────────────────────
+    -- Blizzard = stock WoW window art; Flat (ElvUI) = ElvUI skin when installed, else flat panels.
+    local themeLabel = NS.CB_CreateLabel(themeChild, "Theme")
+    NS.CB_AnchorWall(themeLabel, themeChild, "TOPLEFT")
+    local themeDD = NS.CB_CreateDropdown(themeChild, "CleanBotThemeDropdown", 120)
+    NS.CB_AnchorBelow(themeDD, themeLabel)
+    UIDropDownMenu_Initialize(themeDD, function()
+        for _, t in ipairs(NS.THEMES) do
+            local info = UIDropDownMenu_CreateInfo()
+            info.text    = t.label
+            info.value   = t.key
+            info.checked = (pendingTheme == t.key)
+            info.func    = function()
+                -- Accent/transparency still at the old theme's defaults follow the new theme's
+                -- defaults, so switching theme never persists the Blizzard values (accent alpha 0)
+                -- into Flat. Customised values are kept. See NS.CB_CarryThemeValues.
+                local ac
+                ac, pendingTransparency = NS.CB_CarryThemeValues(pendingTheme, t.key,
+                    { r = pendingAccentR, g = pendingAccentG, b = pendingAccentB, a = pendingAccentA },
+                    pendingTransparency)
+                pendingAccentR, pendingAccentG, pendingAccentB, pendingAccentA = ac.r, ac.g, ac.b, ac.a
+                pendingTheme = t.key
+                if syncPendingToUI then syncPendingToUI() end
+            end
+            UIDropDownMenu_AddButton(info)
+        end
+    end)
+    UIDropDownMenu_SetText(themeDD, NS.CB_ThemeLabel(pendingTheme))
+
     -- ── Scale ──────────────────────────────────────────────────
     local scaleSlider = NS.CB_CreateSlider(themeChild, "CleanBotScaleSlider", "Scale",
         50, 150, pendingScale, "50%", "150%", function(v) pendingScale = v; if syncApplyBtn then syncApplyBtn() end end)
     scaleSlider:SetWidth(SLIDER_W)
-    NS.CB_AnchorWall(scaleSlider, themeChild, "TOPLEFT")
+    NS.CB_AnchorBelow(scaleSlider, themeDD)
 
     -- ── Transparency ───────────────────────────────────────────
     local transSlider = NS.CB_CreateSlider(themeChild, "CleanBotTransSlider", "Transparency",
@@ -561,6 +611,8 @@ NS.CleanBot_BuildSettingsTab = function()
         end,
         true, NS.accentColor.a)
     NS.CB_AnchorBelow(colorSwatch, transSlider)
+    -- The Blizzard theme draws stock borders in their fixed colors, so the accent has no effect there.
+    if NS.CB_IsBlizzardTheme() then colorSwatch:Hide() end
 
     -- ── Layout tab: ScrollFrame ────────────────────────────────
     local layoutSF, layoutChild = NS.CB_CreateScrollFrame(layoutPanel, "CleanBotLayoutScroll")
@@ -1073,6 +1125,7 @@ NS.CleanBot_BuildSettingsTab = function()
 
     -- ── Sync helper ────────────────────────────────────────────
     syncPendingToUI = function()
+        UIDropDownMenu_SetText(themeDD, NS.CB_ThemeLabel(pendingTheme))
         scaleSlider:SetValue(pendingScale)
         transSlider:SetValue(pendingTransparency)
         colorSwatch:setColor(pendingAccentR, pendingAccentG, pendingAccentB, pendingAccentA)
@@ -1092,7 +1145,8 @@ NS.CleanBot_BuildSettingsTab = function()
     end
 
     syncApplyBtn = function()
-        local dirty = pendingScale ~= NS.scale
+        local dirty = pendingTheme ~= appliedTheme
+            or pendingScale ~= NS.scale
             or pendingTransparency ~= NS.transparency
             or pendingAccentR ~= NS.accentColor.r
             or pendingAccentG ~= NS.accentColor.g

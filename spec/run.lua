@@ -29,5 +29,6 @@ dofile("spec/chatfilter_spec.lua")
 dofile("spec/layout_spec.lua")
 dofile("spec/actionbar_layout_spec.lua")
 dofile("spec/recruiter_spec.lua")
+dofile("spec/theme_spec.lua")
 
 _RUN_FINISH()

@@ -362,7 +362,7 @@ local function CB_BuildPanel()
     tabIcon:SetTexture("Interface\\Icons\\INV_Misc_GroupLooking")
     tabIcon:SetAllPoints()
     NS.CB_CropIcon(tabIcon)
-    if NS.ElvUI_S and tabIcon.SetInside then tabIcon:SetInside() end
+    if NS.ElvUI_HostS and tabIcon.SetInside then tabIcon:SetInside() end
     -- Replaces the template's default OnEnter, which does GameTooltip:SetText(self.tooltip) and
     -- errors when self.tooltip is unset (the template expects the spellbook to assign it).
     NS.CB_SetTooltip(recruiterTab, "Recruit a Bot",

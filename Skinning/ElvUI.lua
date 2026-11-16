@@ -2,27 +2,120 @@
 -- Skinning\ElvUI.lua  —  ElvUI integration, fallback backdrops,
 --                        and structural frame/panel skinning.
 --
--- Centralises everything ElvUI-related: the module handles and
--- detection, the plain-backdrop fallback, the theme refresh
+-- Centralises everything ElvUI-related: the theme selection
+-- (Blizzard / Flat (ElvUI)), the module handles and detection,
+-- the plain-backdrop fallback, the theme refresh
 -- functions (accent / transparency / scale), and the panel /
 -- inner / container / scroll skin helpers.
 -- ============================================================
 local NS = CleanBotNS
 
 -- ============================================================
--- ElvUI handles (populated by NS.CB_InitElvUI at PLAYER_LOGIN)
+-- Themes
+--
+-- "blizzard" — stock WoW window art (gold dialog border, grey Interface-Options boxes,
+--              Options-style tabs) on every CleanBot window, even when ElvUI is installed.
+-- "flat"     — the original CleanBot look: ElvUI skinning when ElvUI is installed, otherwise
+--              flat accent/transparency panels.
+-- The theme is chosen at login (before CB_InitElvUI) and changing it requires a /reload,
+-- because ElvUI skinning and widget templates are applied once at creation.
 -- ============================================================
-NS.ElvUI_E = nil
-NS.ElvUI_S = nil
+NS.THEMES = {
+    { key = "blizzard", label = "Blizzard"     },
+    { key = "flat",     label = "Flat (ElvUI)" },
+}
+NS.DEFAULT_THEME = "blizzard"
+NS.theme         = NS.DEFAULT_THEME
+
+--- Validates a saved theme key, falling back to the default for nil/unknown values.
+---@param saved any  The stored value (CleanBot_SavedVars.theme).
+---@return string    A valid theme key.
+NS.CB_ResolveTheme = function(saved)
+    for _, t in ipairs(NS.THEMES) do
+        if t.key == saved then return saved end
+    end
+    return NS.DEFAULT_THEME
+end
+
+--- True when the active theme is the stock Blizzard look.
+---@return boolean
+NS.CB_IsBlizzardTheme = function()
+    return NS.theme ~= "flat"
+end
+
+--- Display label for a theme key (e.g. "Flat (ElvUI)").
+---@param key string
+---@return string
+NS.CB_ThemeLabel = function(key)
+    for _, t in ipairs(NS.THEMES) do
+        if t.key == key then return t.label end
+    end
+    return key
+end
+
+-- ============================================================
+-- ElvUI handles (populated by NS.CB_InitElvUI at PLAYER_LOGIN)
+--
+-- ElvUI_E / ElvUI_S — set only when ElvUI is loaded AND the "flat" theme is active. Every
+--   CleanBot-owned frame branches on these, so under the Blizzard theme they stay nil and all
+--   CleanBot windows take the stock-art path.
+-- ElvUI_HostE / ElvUI_HostS — set whenever ElvUI is loaded, regardless of theme. Used only by
+--   pieces CleanBot attaches to Blizzard frames that ElvUI itself reskins (merchant side tabs,
+--   the Dungeon Finder recruiter tab, trade-slot highlights) so they keep matching their host.
+-- ============================================================
+NS.ElvUI_E     = nil
+NS.ElvUI_S     = nil
+NS.ElvUI_HostE = nil
+NS.ElvUI_HostS = nil
 
 -- Detect ElvUI and grab its Skins module. Called once at login,
--- when ElvUI is guaranteed to be loaded.
---- Populates NS.ElvUI_E / NS.ElvUI_S when ElvUI is installed.
+-- when ElvUI is guaranteed to be loaded. NS.theme must already be resolved.
+--- Populates the host handles when ElvUI is installed, and the theme handles for "flat".
 NS.CB_InitElvUI = function()
+    NS.ElvUI_E, NS.ElvUI_S, NS.ElvUI_HostE, NS.ElvUI_HostS = nil, nil, nil, nil
     if IsAddOnLoaded("ElvUI") then
-        NS.ElvUI_E = unpack(ElvUI)
-        if NS.ElvUI_E then NS.ElvUI_S = NS.ElvUI_E:GetModule("Skins") end
+        local E = unpack(ElvUI)
+        local S = E and E:GetModule("Skins") or nil
+        NS.ElvUI_HostE, NS.ElvUI_HostS = E, S
+        if NS.theme == "flat" then
+            NS.ElvUI_E, NS.ElvUI_S = E, S
+        end
     end
+end
+
+--- Default accent color and transparency for a theme, given the CURRENT ElvUI detection.
+--- Blizzard: fully opaque stock window, accent unused (kept invisible for when Flat is chosen).
+--- Flat + ElvUI: black opaque border, 75% (matches ElvUI's solid 1px border style).
+--- Flat without ElvUI: no border tint, 90%.
+---@param theme string  Theme key.
+---@return table accentColor  { r, g, b, a }
+---@return number transparency  0–100
+NS.CB_ThemeDefaultValues = function(theme)
+    if theme == "flat" and NS.ElvUI_HostS then
+        return { r = 0.0, g = 0.0, b = 0.0, a = 1 }, 75
+    elseif theme == "flat" then
+        return { r = 1.0, g = 1.0, b = 1.0, a = 0 }, 90
+    end
+    return { r = 1.0, g = 1.0, b = 1.0, a = 0 }, 100
+end
+
+--- Carries accent/transparency across a theme switch: a value still at oldTheme's default
+--- becomes newTheme's default (so switching to Flat + ElvUI gets its black opaque border instead
+--- of persisting the Blizzard accent alpha 0); customised values are kept as-is.
+---@param oldTheme     string  Theme key being switched from.
+---@param newTheme     string  Theme key being switched to.
+---@param accent       table   { r, g, b, a } currently pending.
+---@param transparency number  0–100 currently pending.
+---@return table  accent        { r, g, b, a } to use for newTheme (a new table).
+---@return number transparency
+NS.CB_CarryThemeValues = function(oldTheme, newTheme, accent, transparency)
+    local oldAc, oldT = NS.CB_ThemeDefaultValues(oldTheme)
+    local newAc, newT = NS.CB_ThemeDefaultValues(newTheme)
+    local ac = { r = accent.r, g = accent.g, b = accent.b, a = accent.a }
+    if accent.r == oldAc.r and accent.g == oldAc.g and accent.b == oldAc.b and accent.a == oldAc.a then
+        ac = newAc
+    end
+    return ac, (transparency == oldT) and newT or transparency
 end
 
 -- ============================================================
@@ -57,6 +150,22 @@ NS.OUTER_BACKDROP = {
     insets = { left = 11, right = 12, top = 12, bottom = 11 },
 }
 
+-- Blizzard theme inner box — the grey tooltip-border box Blizzard's Interface Options uses for
+-- its panel containers (OptionsFrameTemplates.xml: UI-Tooltip-Border, border color .6 grey).
+-- Same 12px edge / 3px insets as PANEL_BACKDROP so switching theme never shifts the layout.
+NS.BLIZZ_BOX_BACKDROP = {
+    bgFile   = "Interface\\Tooltips\\UI-Tooltip-Background",
+    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+    tile = true, tileSize = 16, edgeSize = 12,
+    insets = { left = 3, right = 3, top = 3, bottom = 3 },
+}
+NS.BLIZZ_BOX_BORDER = { r = 0.6, g = 0.6, b = 0.6, a = 1 }
+-- Fixed (theme-independent) fills: a faint shade per nested box, darker for recessed lists, and the
+-- stock tooltip background (TOOLTIP_DEFAULT_BACKGROUND_COLOR) for boxes floating on UIParent.
+local BLIZZ_BOX_FILL_ALPHA  = 0.2
+local BLIZZ_LIST_FILL_ALPHA = 0.5
+local BLIZZ_FLOAT_FILL      = { 0.09, 0.09, 0.19 }
+
 -- ============================================================
 -- Skinning helpers
 -- ============================================================
@@ -89,6 +198,8 @@ end
 -- Registry of frames skinned by CB_ApplyFrameSkin.
 -- Each entry stores { skin, brightness, level } so refresh functions can
 -- recompute both brightness and per-level alpha without re-calling the skin function.
+-- Blizzard-theme entries are { skin, level, fixed = true, window, color }: stock border color
+-- (accent is ignored), and only window frames re-apply color+alpha on transparency change.
 NS.CB_skinnedFrames = {}
 
 -- Non-ElvUI only: each nesting level multiplies the base alpha by this factor,
@@ -116,20 +227,29 @@ end
 ---@param a number? Alpha 0–1 (defaults to 1).
 NS.CB_RefreshAccentColor = function(r, g, b, a)
     local alpha = a or 1
-    for frame, _ in pairs(NS.CB_skinnedFrames) do
-        frame:SetBackdropBorderColor(r, g, b, alpha)
+    for frame, info in pairs(NS.CB_skinnedFrames) do
+        if not info.fixed then
+            frame:SetBackdropBorderColor(r, g, b, alpha)
+        end
     end
 end
 
 -- Re-applies background transparency to every registered panel frame.
 -- t is 0–100; 100 = fully opaque, 0 = fully transparent.
 -- Non-ElvUI frames additionally apply per-level exponential falloff.
+-- Blizzard-theme frames: only "window" frames (the outermost dialog and boxes floating on
+-- UIParent) follow t; nested boxes keep their fixed shade.
 --- Re-applies background transparency to every registered panel frame.
 ---@param t number  Opacity 0–100 (100 = fully opaque).
 NS.CB_RefreshTransparency = function(t)
     local baseAlpha = (t or 100) / 100
     for frame, info in pairs(NS.CB_skinnedFrames) do
-        if info.skin == "panel" then
+        if info.fixed then
+            if info.window then
+                local c = info.color
+                frame:SetBackdropColor(c[1], c[2], c[3], baseAlpha)
+            end
+        elseif info.skin == "panel" then
             frame:SetBackdropColor(info.brightness, info.brightness, info.brightness,
                 CB_LevelAlpha(baseAlpha, info.level))
         end
@@ -394,7 +514,8 @@ end
 
 -- Single entry point for skinning any structural frame.
 --
--- nestLevel controls which backdrop and fill brightness to use:
+-- Blizzard theme: handled by the early branch below (stock dialog window / grey Options boxes).
+-- Flat theme — nestLevel controls which backdrop and fill brightness to use:
 --   0        — outermost window (CleanBotFrame, inventory windows).
 --              Non-ElvUI: ornate OUTER_BACKDROP; ElvUI: SetTemplate("Default").
 --   1, 2, … — inner panels. Both paths use PANEL_BACKDROP / SetTemplate("Default");
@@ -412,6 +533,37 @@ end
 ---@param nestLevel number? Nesting depth (0 = outermost window, default 1).
 NS.CB_ApplyFrameSkin = function(frame, nestLevel)
     local level = nestLevel or 1
+
+    -- Blizzard theme: stock art with fixed colors. Level 0 is the ornate dialog window at full
+    -- texture brightness; deeper levels are grey Interface-Options boxes with a faint fixed shade.
+    -- A box parented straight to UIParent (vendor/recruiter panels, action bar, debug window) floats
+    -- over the world, so it gets the stock tooltip background instead. Only these "window" frames
+    -- follow Transparency; the accent color is not used.
+    if NS.CB_IsBlizzardTheme() then
+        local bc     = NS.BLIZZ_BOX_BORDER
+        local alpha  = (NS.transparency or 100) / 100
+        local window, color = true, nil
+        if level == 0 then
+            frame:SetBackdrop(NS.OUTER_BACKDROP)
+            frame:SetBackdropBorderColor(1, 1, 1, 1)
+            color = { 1, 1, 1 }
+        else
+            frame:SetBackdrop(NS.BLIZZ_BOX_BACKDROP)
+            frame:SetBackdropBorderColor(bc.r, bc.g, bc.b, bc.a)
+            if frame.GetParent and frame:GetParent() == UIParent then
+                color = BLIZZ_FLOAT_FILL
+            else
+                window = false
+            end
+        end
+        if window then
+            frame:SetBackdropColor(color[1], color[2], color[3], alpha)
+        else
+            frame:SetBackdropColor(0, 0, 0, BLIZZ_BOX_FILL_ALPHA)
+        end
+        NS.CB_skinnedFrames[frame] = { skin = "panel", level = level, fixed = true, window = window, color = color }
+        return
+    end
 
     if level == 0 then
         -- Outermost window: accent color has no tint by default (a=0 on Blizzard).
@@ -452,6 +604,13 @@ end
 -- Promoted to NS so CB_CreateSelectList (Skinning\Widgets.lua) can reach it.
 ---@param frame table  The list container frame to skin.
 NS.CB_ApplyInnerSkin = function(frame)
+    if NS.CB_IsBlizzardTheme() then
+        local bc = NS.BLIZZ_BOX_BORDER
+        frame:SetBackdrop(NS.BLIZZ_BOX_BACKDROP)
+        frame:SetBackdropColor(0, 0, 0, BLIZZ_LIST_FILL_ALPHA)
+        frame:SetBackdropBorderColor(bc.r, bc.g, bc.b, bc.a)
+        return
+    end
     local ac = NS.accentColor or { r = 0.3, g = 0.3, b = 0.3, a = 1 }
     if NS.ElvUI_S then
         frame:StripTextures()
@@ -535,11 +694,13 @@ end
 
 -- Restyles a SpellBookSkillLineTabTemplate side-tab to ElvUI's flat dark backdrop + border (the same
 -- StripTextures + StyleButton + SetTemplate recipe ElvUI uses on the real skill-line tabs), replacing
--- the gold Blizzard frame so the tab matches a skinned attached window. No-op without ElvUI. Shared by
+-- the gold Blizzard frame so the tab matches a skinned attached window. These tabs hang off Blizzard
+-- frames ElvUI itself reskins (MerchantFrame, LFDParentFrame), so this follows the HOST handle: it
+-- applies whenever ElvUI is loaded, regardless of CleanBot's theme. No-op without ElvUI. Shared by
 -- the vendor strip (Merchant.lua) and the Dungeon Finder recruiter tab (Recruiter.lua).
 ---@param button table  A button built from SpellBookSkillLineTabTemplate.
 NS.CB_SkinSideTab = function(button)
-    if not NS.ElvUI_S then return end
+    if not NS.ElvUI_HostS then return end
     if button.StripTextures then button:StripTextures()       end
     if button.StyleButton  then button:StyleButton(nil, true) end
     if button.SetTemplate  then button:SetTemplate("Default", true) end

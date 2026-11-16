@@ -65,11 +65,13 @@ local function CB_CreateTradeSlotOverlays()
 
             -- Highlight texture — mirrors the native slot hover since our overlay
             -- blocks mouse events from reaching the underlying frame.
-            -- ElvUI uses its flat normTex at low alpha; Blizz uses ButtonHilight-Square.
+            -- ElvUI uses its flat normTex at low alpha; Blizz uses ButtonHilight-Square. Follows the
+            -- HOST handle: ElvUI reskins TradeFrame whenever it is loaded, whatever CleanBot's theme.
             local hl = overlay:CreateTexture(nil, "HIGHLIGHT")
             hl:SetAllPoints()
-            if NS.ElvUI_E and NS.ElvUI_E.media and NS.ElvUI_E.media.normTex then
-                hl:SetTexture(NS.ElvUI_E.media.normTex)
+            local hostE = NS.ElvUI_HostE
+            if hostE and hostE.media and hostE.media.normTex then
+                hl:SetTexture(hostE.media.normTex)
                 hl:SetVertexColor(1, 1, 1, 0.3)
             else
                 hl:SetTexture("Interface\\Buttons\\ButtonHilight-Square")

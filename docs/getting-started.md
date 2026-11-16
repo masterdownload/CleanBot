@@ -11,7 +11,8 @@ drive your bots from a tidy window, a right-click menu, and an optional floating
   CleanBot talks to your bots silently and syncs their data instantly. Without it, CleanBot
   falls back to whispers — everything still works, just with more chat traffic (which you can
   hide; see [Settings](settings.md) → *Hide Bot Chatter*).
-- **Optional — ElvUI:** if you have it installed, CleanBot automatically matches its look.
+- **Optional — ElvUI:** CleanBot uses the standard Blizzard look by default; choose the
+  **Flat (ElvUI)** theme in [Settings](settings.md) → *Theme* to match your ElvUI skin.
 
 The companion *Multibot* addon is **not** required.
 

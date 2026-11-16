@@ -277,9 +277,10 @@ NS.MARGIN_DEFAULTS = {
     section  = { top = 0, bottom = 0, left = 0, right = 0 },
 }
 -- Canonical defaults for theme settings — read by the Defaults button.
--- accentColor is replaced with the skin-appropriate default at PLAYER_LOGIN (after
--- ElvUI detection): black opaque for ElvUI (matches its solid border style), alpha 0
--- for plain Blizzard UI (no visible border tint). NS.accentColor is seeded from the
+-- accentColor/transparency are replaced with the theme-appropriate defaults at PLAYER_LOGIN
+-- (after the theme is resolved and ElvUI is detected) via NS.CB_ThemeDefaultValues:
+-- Blizzard → opaque stock window, accent unused; Flat + ElvUI → black opaque border, 75%;
+-- Flat without ElvUI → no border tint (alpha 0), 90%. NS.accentColor is seeded from the
 -- same value there, so a fresh install looks exactly like what Defaults applies.
 NS.THEME_DEFAULTS = {
     scale        = 100,
@@ -500,17 +501,17 @@ local initFrame = CreateFrame("Frame")
 initFrame:RegisterEvent("PLAYER_LOGIN")
 initFrame:SetScript("OnEvent", function(self, event)
     if event == "PLAYER_LOGIN" then
+        -- The theme must be resolved BEFORE ElvUI detection: CB_InitElvUI only exposes the
+        -- ElvUI skin handles (NS.ElvUI_E/S) when the "flat" theme is active. No saved theme
+        -- (fresh install or an update from before themes existed) → the Blizzard default.
+        NS.theme = NS.CB_ResolveTheme(type(CleanBot_SavedVars) == "table" and CleanBot_SavedVars.theme or nil)
         NS.CB_InitElvUI()
 
-        -- Set the skin-appropriate default accent alpha now that ElvUI detection has run.
+        -- Set the theme-appropriate default accent/transparency now that ElvUI detection has run.
         -- This must happen before SavedVars are applied so that the Defaults button in
         -- Settings shows the correct value, and so that NS.accentColor starts at the
-        -- right value when no saved data exists yet.
-        -- ElvUI: black opaque (matches its solid 1px border). Plain Blizzard: white at
-        -- alpha 0 — no border tint by default; the white hue is just the swatch's
-        -- starting point if the user raises the alpha.
-        local defaultAccentColor  = NS.ElvUI_S and { r = 0.0, g = 0.0, b = 0.0, a = 1 } or { r = 1.0, g = 1.0, b = 1.0, a = 0 }
-        local defaultTransparency = NS.ElvUI_S and 75 or 90
+        -- right value when no saved data exists yet. See NS.CB_ThemeDefaultValues.
+        local defaultAccentColor, defaultTransparency = NS.CB_ThemeDefaultValues(NS.theme)
         NS.THEME_DEFAULTS.accentColor   = defaultAccentColor
         NS.THEME_DEFAULTS.transparency  = defaultTransparency
         NS.transparency                 = defaultTransparency

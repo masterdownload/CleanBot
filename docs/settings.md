@@ -6,11 +6,18 @@ The **Settings** tab has four sub-tabs: **Theme**, **Layout**, **Other**, and **
 
 Appearance of the CleanBot window:
 
+- **Theme** — **Blizzard** (default) uses the standard WoW window art: the gold dialog border,
+  grey Interface-Options-style boxes, and Options-style tabs. **Flat (ElvUI)** is the original
+  CleanBot look: it matches your ElvUI skin when ElvUI is installed, otherwise flat panels tinted
+  by the Accent Color. Changing the theme needs a UI reload — after **Apply**, CleanBot offers to
+  reload for you.
 - **Scale** — overall size.
 - **Transparency** — background opacity.
-- **Accent Color** — the highlight color used throughout.
+- **Accent Color** — the border tint (Flat (ElvUI) theme only; the Blizzard theme keeps the stock
+  border colors, so this option is hidden there).
 
-If you have **ElvUI** installed, CleanBot automatically matches its skin — no setting needed.
+If you use **ElvUI** and want CleanBot to match it, pick the **Flat (ElvUI)** theme. CleanBot's
+tabs on the vendor and Dungeon Finder windows always match ElvUI when it is installed.
 
 ## Layout
 
@@ -24,8 +31,8 @@ cosmetic — leave it alone unless you want to tweak the spacing.
 
 - **Enable Bot Emotes** — a bot waves when you switch to its tab.
 - **Auto-Enable Self as Bot** — run your own character as a bot each time you log in.
-- **Enable Item Glow** — rarity-colored glow on uncommon-or-better items (shown only without
-  ElvUI, which has its own quality borders).
+- **Enable Item Glow** — rarity-colored glow on uncommon-or-better items (shown unless CleanBot is
+  using the ElvUI skin, which has its own quality borders).
 - **Hide Bot Chatter** — keeps CleanBot's own command whispers, the bot replies it requests, and
   the server output it triggers out of your chat window. Turn it **off** if you want to see the
   raw traffic.

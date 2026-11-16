@@ -277,7 +277,7 @@ local function CB_AcquireTab(key)
             tab:SetNormalTexture("Interface\\Icons\\INV_Misc_QuestionMark")
             tab.portrait = tab:GetNormalTexture()
         end
-        if NS.ElvUI_S and tab.portrait and tab.portrait.SetInside then tab.portrait:SetInside() end
+        if NS.ElvUI_HostS and tab.portrait and tab.portrait.SetInside then tab.portrait:SetInside() end
 
         -- Tooltip: the character's name (class-colored) + the action-bar-style blue hint.
         NS.CB_AttachTooltip(tab, function(tt)
@@ -420,8 +420,9 @@ local function CB_BuildStrip()
     -- "Shopping for <bot>" banner, centered over the top of the vendor. Parented to the strip (so it
     -- hides with the feature) but anchored to MerchantFrame. The merchant title sits at a different
     -- height on ElvUI vs the Blizzard frame, so the vertical offset is path-specific (tune in-game).
+    -- Follows the HOST handle: ElvUI reskins MerchantFrame whenever it is loaded, whatever CleanBot's theme.
     shoppingLabel = stripContainer:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    shoppingLabel:SetPoint("TOP", MerchantFrame, "TOP", 0, NS.ElvUI_S and LABEL_Y_ELVUI or LABEL_Y_BLIZZ)
+    shoppingLabel:SetPoint("TOP", MerchantFrame, "TOP", 0, NS.ElvUI_HostS and LABEL_Y_ELVUI or LABEL_Y_BLIZZ)
     shoppingLabel:Hide()
 
     -- Cog: a tab matching the portraits (same spellbook side-tab template), at the top of the
@@ -438,7 +439,7 @@ local function CB_BuildStrip()
     cogIcon:SetTexture("Interface\\Icons\\INV_Misc_Gear_01")
     cogIcon:SetAllPoints()
     NS.CB_CropIcon(cogIcon)                                 -- trim the icon's baked border
-    if NS.ElvUI_S and cogIcon.SetInside then cogIcon:SetInside() end
+    if NS.ElvUI_HostS and cogIcon.SetInside then cogIcon:SetInside() end
     cogBtn:SetScript("OnClick", function(self) self:SetChecked(false) end)   -- hover-only; never "selected"
     cogBtn:Hide()
 

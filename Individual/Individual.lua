@@ -1692,7 +1692,7 @@ local function CB_CreateSlot(index)
     tab:SetWidth(NS.TAB_WIDTH)
     local icon = tab:CreateTexture(nil, "OVERLAY")
     icon:SetSize(14, 14)
-    icon:SetPoint("LEFT", tab, "LEFT", NS.PADDING.panel.left, 0)
+    icon:SetPoint("LEFT", tab, "LEFT", tab.contentInsetX or NS.PADDING.panel.left, tab.contentYOffset or 0)
     icon:SetTexture("Interface\\WorldStateFrame\\Icons-Classes")
     tab:Hide()
     slot.tabBtn  = tab

@@ -930,11 +930,46 @@ NS.CB_CreateLabeledCheckBox = function(parent, name, labelText, desc)
     return cb, lbl
 end
 
+-- Stock Blizzard tab (Blizzard theme): Interface Options' "Game / AddOns" tab art
+-- (OptionsFrameTabButtonTemplate — 20px end caps + stretchable middle, active state drawn 3px
+-- lower so it merges into the panel below). The template's OnShow would shrink the tab to its
+-- text width (PanelTemplates_TabResize(self, 0)), so it is replaced: the middle pieces are
+-- stretched to whatever width the caller sets, keeping every tab row's layout unchanged.
+---@param parent table   Parent frame.
+---@param name   string  Global frame name (required — the template's pieces are $parent-named).
+---@return table         The created Button with SetActive(bool) and content offsets stamped.
+local function CB_CreateBlizzardTab(parent, name)
+    local tab   = CreateFrame("Button", name, parent, "OptionsFrameTabButtonTemplate")
+    local left  = _G[name .. "Left"]
+    local mids  = { _G[name .. "Middle"], _G[name .. "MiddleDisabled"] }
+
+    local rawSetWidth, rawSetSize = tab.SetWidth, tab.SetSize
+    local function fit(self, w)
+        local side = left and left:GetWidth() or 20
+        for _, m in ipairs(mids) do
+            if m then m:SetWidth(math.max(w - 2 * side, 1)) end
+        end
+    end
+    tab.SetWidth = function(self, w) rawSetWidth(self, w); fit(self, w) end
+    tab.SetSize  = function(self, w, h) rawSetSize(self, w, h); fit(self, w) end
+    tab:SetScript("OnShow", function(self) fit(self, self:GetWidth()) end)
+
+    tab.SetActive = function(self, active)
+        if active then PanelTemplates_SelectTab(self) else PanelTemplates_DeselectTab(self) end
+    end
+    -- Where inline decorations (e.g. the bot tab's class icon) should sit to line up with the
+    -- template's text (ButtonText is CENTER, y = -3) and clear the curved end cap.
+    tab.contentYOffset = -3
+    tab.contentInsetX  = 10
+    return tab
+end
+
 -- Tab button built on UIPanelButtonTemplate, with the active/inactive state layered
 -- on top. The native TabButtonTemplate was tried but ElvUI's HandleTab insets its
 -- backdrop 10px per side (tuned for full-size frame tabs), which renders this addon's
 -- compact NS.TAB_WIDTH (88px) tabs far too small — so the button template + HandleButton
--- gives a correctly-sized, ElvUI-consistent result instead.
+-- gives a correctly-sized, ElvUI-consistent result instead. Under the Blizzard theme the
+-- stock Interface Options tab art is used instead (CB_CreateBlizzardTab).
 -- Exposes tab:SetActive(bool) so call sites do not need to manage font objects or states.
 ---@param parent  table    Parent frame.
 ---@param name    string?  Optional global frame name.
@@ -942,23 +977,27 @@ end
 ---@param onClick fun()?   Click handler.
 ---@return table           The created Button with a SetActive(bool) method.
 NS.CB_CreateTab = function(parent, name, text, onClick)
-    local tab = CreateFrame("Button", name, parent, "UIPanelButtonTemplate")
+    local blizz = NS.CB_IsBlizzardTheme() and name
+    local tab = blizz and CB_CreateBlizzardTab(parent, name)
+                       or CreateFrame("Button", name, parent, "UIPanelButtonTemplate")
     tab:SetSize(NS.TAB_WIDTH, NS.TAB_HEIGHT)
     if text    then tab:SetText(text)                   end
     if onClick then tab:SetScript("OnClick", onClick)   end
-    if NS.ElvUI_S then NS.ElvUI_S:HandleButton(tab)     end
 
-    -- Unified active/inactive toggle.
-    tab.SetActive = function(self, active)
-        if active then
-            self:SetNormalFontObject(GameFontHighlightSmall)
-            self:SetButtonState("PUSHED", true)
-        else
-            self:SetNormalFontObject(GameFontNormalSmall)
-            self:SetButtonState("NORMAL", false)
+    if not blizz then
+        if NS.ElvUI_S then NS.ElvUI_S:HandleButton(tab) end
+
+        -- Unified active/inactive toggle.
+        tab.SetActive = function(self, active)
+            if active then
+                self:SetNormalFontObject(GameFontHighlightSmall)
+                self:SetButtonState("PUSHED", true)
+            else
+                self:SetNormalFontObject(GameFontNormalSmall)
+                self:SetButtonState("NORMAL", false)
+            end
         end
     end
-
     tab.marginTop    = NS.MARGIN.tab.top
     tab.marginBottom = NS.MARGIN.tab.bottom
     tab.marginLeft   = NS.MARGIN.tab.left
