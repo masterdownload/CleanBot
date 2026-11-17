@@ -1,0 +1,115 @@
+name: Bug report
+description: Something in the CleanBot addon is broken or behaves unexpectedly.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Please fill in as much as you can — it makes bugs much faster to fix.
+        If the problem is with how bots *behave* on the server (combat AI, pathing, strategies doing nothing even when typed in chat), it probably belongs to [mod-playerbots](https://github.com/mod-playerbots/mod-playerbots/issues) instead.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you submit
+      options:
+        - label: I searched the [existing issues](https://github.com/masterdownload/CleanBot/issues?q=is%3Aissue) and this hasn't been reported yet.
+          required: true
+        - label: I'm using the [latest release](https://github.com/masterdownload/CleanBot/releases/latest) of CleanBot.
+          required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: CleanBot version
+      description: Shown in the AddOns list on the character select screen, or in `CleanBot.toc`.
+      placeholder: "0.13-md.2"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: theme
+    attributes:
+      label: Theme
+      description: Settings → Theme.
+      options:
+        - Blizzard (default)
+        - Flat (ElvUI)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: elvui
+    attributes:
+      label: Is ElvUI installed?
+      options:
+        - "No"
+        - "Yes"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: bridge
+    attributes:
+      label: Is the Multibot Bridge server module installed?
+      description: "[mod-multibot-bridge](https://github.com/Wishmaster117/mod-multibot-bridge). Not sure? Type `/cbdebug` in chat — the first line shows the bridge status."
+      options:
+        - "No"
+        - "Yes"
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: server
+    attributes:
+      label: Server core and Playerbots version
+      description: Core plus the mod-playerbots commit or date, if you know it.
+      placeholder: "AzerothCore + mod-playerbots (updated 2026-11-01)"
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What went wrong, and what did you expect to happen instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open CleanBot (/cb) and go to the Individual tab
+        2. Select a bot
+        3. Click ...
+        4. See the error
+    validations:
+      required: true
+
+  - type: textarea
+    id: lua-errors
+    attributes:
+      label: Lua errors
+      description: Turn on errors with `/console scriptErrors 1` (or use BugSack/BugGrabber), reproduce the bug, and paste the full error text here.
+      render: text
+
+  - type: textarea
+    id: cbdebug
+    attributes:
+      label: "/cbdebug output"
+      description: Type `/cbdebug` in chat right after the problem happens and paste what it prints.
+      render: text
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots
+      description: Drag and drop images here if they help show the problem.
+
+  - type: textarea
+    id: addons
+    attributes:
+      label: Other addons
+      description: Any other UI addons you run (especially ones that change frames, bags, or chat).

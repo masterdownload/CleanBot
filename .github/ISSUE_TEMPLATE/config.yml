@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Bot behaviour / server-side Playerbots problems
+    url: https://github.com/mod-playerbots/mod-playerbots/issues
+    about: Combat AI, pathing, or strategies not working even when typed in chat are handled by mod-playerbots.
+  - name: CleanBot documentation
+    url: https://github.com/masterdownload/CleanBot/tree/main/docs
+    about: Getting started, settings, managing bots, and debug tools.

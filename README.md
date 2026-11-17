@@ -73,3 +73,12 @@ A clean interface to manage Playerbots on WotLK 3.3.5a Servers. No more complex 
 - Open Bot Inventory on Trade
     - Drag and Drop Items to Trade
     - Right Click Items to Remove
+
+# Support
+- **Download:** grab the zip from the [latest release](https://github.com/masterdownload/CleanBot/releases/latest) and extract it into `Interface\AddOns` (you should end up with `Interface\AddOns\CleanBot\CleanBot.toc`).
+- **Found a bug?** [Open a bug report](https://github.com/masterdownload/CleanBot/issues/new?template=bug_report.yml). Include your CleanBot version, any Lua errors (`/console scriptErrors 1`), and the output of `/cbdebug`.
+- **Have an idea?** [Request a feature](https://github.com/masterdownload/CleanBot/issues/new?template=feature_request.yml).
+- **Bots misbehaving on the server** (combat AI, pathing, strategies ignored even when typed in chat)? That's usually [mod-playerbots](https://github.com/mod-playerbots/mod-playerbots/issues).
+- More help: see the [docs](docs/).
+
+This is a fork of [bennybroseph/CleanBot](https://github.com/bennybroseph/CleanBot) with extra features (Blizzard theme, Alt Army, BridgeRpc). Please report issues with this version here.
