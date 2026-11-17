@@ -38,7 +38,7 @@ A clean interface to manage Playerbots on WotLK 3.3.5a Servers. No more complex 
     - Read quest text and requirements directly for any quest you both share
 - Abandon Bot Quests
 
-<img width="700" alt="image" src="https://github.com/user-attachments/assets/083d79cc-d36a-443e-bc55-7d21d037e57f" />
+<img width="700" alt="Bot quest log" src="docs/images/quest-log.png" />
 
 # Group Tab
 - Multiselect groups and bots using the standard windows shortcuts
