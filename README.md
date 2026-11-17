@@ -16,9 +16,11 @@ A clean interface to manage Playerbots on WotLK 3.3.5a Servers. No more complex 
 - Create Custom Presets, Invite All From Preset
 - Link an Account for Altbot Usage
     - Invite Linked Account, Unlink Account
+- Alt Army: log your account's alts in or out as bots, one at a time or as a list
 - Fully Collapsable Sections
 
-<img width="300" alt="image" src="https://github.com/user-attachments/assets/147bb107-6b97-46b8-9d1c-80d9f928672b" />
+<img width="300" alt="Manage tab" src="docs/images/manage.png" />
+<img width="300" alt="Altbots and Alt Army sections" src="docs/images/alt-army.png" />
 
 # Individual Tab
 - Manage Individual Bots Within Your Party or Raid
@@ -28,8 +30,8 @@ A clean interface to manage Playerbots on WotLK 3.3.5a Servers. No more complex 
     - View Gold and Items in an intuitive and familiar interface
     - Open Bank (if nearby a banker) or Sell Grays (if near a vendor)
 
-<img width="500" alt="image" src="https://github.com/user-attachments/assets/dc808972-03ca-414a-8a1a-70af408bcb1b" />
-<img width="300" alt="603430857-b9f2179f-db59-44a8-880e-b999b6505b41" src="https://github.com/user-attachments/assets/e747a2d9-e461-402c-97ad-d386d6e49ec6" />
+<img width="500" alt="Individual tab" src="docs/images/individual.png" />
+<img width="300" alt="Bot inventory" src="docs/images/inventory.png" />
 
 ## Quest Log
 - Check Failed, Incomplete, and Completed Quests
@@ -47,7 +49,7 @@ A clean interface to manage Playerbots on WotLK 3.3.5a Servers. No more complex 
 - Dynamic default groups for class and role
     - With multiselect, these groups may be all you need to perfectly manage your next raid
 
-<img width="700" alt="image" src="https://github.com/user-attachments/assets/35b672aa-a48c-4b41-805d-12ebec7209dc" />
+<img width="700" alt="Group tab" src="docs/images/group.png" />
 
 # Mini Action Bar
 - Freely Movable, Snappable, Disableable, and Reorderable
@@ -63,7 +65,9 @@ A clean interface to manage Playerbots on WotLK 3.3.5a Servers. No more complex 
 - Change Theme, Transparency, Scale, Accent Color, and Layout Values
 - Enable or Disable a /wave from the bot when selecting them in the UI
 
-<img width="300" alt="image" src="https://github.com/user-attachments/assets/8036f2c4-d192-45d8-828b-e56a3f771a8c" />
+<img width="250" alt="Settings - Theme" src="docs/images/settings-theme.png" />
+<img width="250" alt="Settings - Layout" src="docs/images/settings-layout.png" />
+<img width="250" alt="Settings - Other" src="docs/images/settings-other.png" />
 
 # Automatic Actions
 - Open Bot Inventory on Trade
